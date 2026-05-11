@@ -29,8 +29,8 @@ from app.store import (
     list_episodes_for_show,
     list_show_profiles,
     set_episode_status,
-    sync_episode_urls_from_config,
     upsert_show_profile,
+    utc_now_iso,
 )
 
 
@@ -259,7 +259,12 @@ def _delete_local_file(path: Path) -> None:
         print(f"delete failed {path}: {e}", file=sys.stderr)
 
 
-def resolve_cover(cfg: dict[str, Any], root: Path) -> Path:
+def resolve_cover(path: str | None, cfg: dict[str, Any], root: Path) -> Path:
+    """按指定路径或全局 paths.cover 解析封面。"""
+    if path and str(path).strip():
+        p = resolve_rel(root, str(path).strip())
+        if p.is_file():
+            return p
     paths = cfg.get("paths") or {}
     rel = str(paths.get("cover") or "Telethon-FastUpload/cover.jpeg").strip()
     p = resolve_rel(root, rel)
@@ -268,29 +273,87 @@ def resolve_cover(cfg: dict[str, Any], root: Path) -> Path:
     return p
 
 
-def seed_shows(conn: sqlite3.Connection, cfg: dict[str, Any]) -> None:
-    shows = cfg.get("shows") or []
-    if not isinstance(shows, list):
-        return
-    for i, s in enumerate(shows):
-        if not isinstance(s, dict):
+def _load_channel_target_map(cfg: dict[str, Any]) -> tuple[dict[str, str], dict[str, str]]:
+    """v2.0: 构建 show_id → telegram_chat_id 和 show_id → cover 映射（来自 monitor.channels）。"""
+    target_map: dict[str, str] = {}
+    cover_map: dict[str, str] = {}
+    default_target = str((cfg.get("telegram") or {}).get("target") or "").strip()
+
+    channels = (cfg.get("monitor") or {}).get("channels") or []
+    for ch in channels:
+        if not isinstance(ch, dict):
             continue
-        sid = str(s.get("id") or "").strip()
-        if not sid:
+        ch_target = str(ch.get("telegram_chat_id") or "").strip()
+        ch_cover = str(ch.get("cover") or "").strip()
+        ch_id = str(ch.get("id") or "").strip()
+        shows = ch.get("shows") or []
+        for s in shows:
+            if not isinstance(s, dict):
+                continue
+            sid = str(s.get("id") or "").strip()
+            if sid:
+                target_map[sid] = ch_target or default_target
+                if ch_cover:
+                    cover_map[sid] = ch_cover
+    return target_map, cover_map
+
+
+def _load_urls_from_txt(txt_path: Path) -> dict[int, str]:
+    """从 txt 文件读取 URL，每行一集（行号=集数）。跳过空行和注释行。"""
+    urls: dict[int, str] = {}
+    if not txt_path.is_file():
+        return urls
+    for i, line in enumerate(txt_path.read_text(encoding="utf-8").splitlines(), start=1):
+        u = line.strip()
+        if u and not u.startswith("#") and u.startswith("http"):
+            urls[i] = u
+    return urls
+
+
+def seed_shows(conn: sqlite3.Connection, cfg: dict[str, Any], root: Path) -> None:
+    """v2.0: 从 monitor.channels 写入 show_profiles，从 txt 文件加载 URL 写入 episode_jobs。"""
+    channels = (cfg.get("monitor") or {}).get("channels") or []
+    i = 0
+    for ch in channels:
+        if not isinstance(ch, dict):
             continue
-        upsert_show_profile(
-            conn,
-            show_id=sid,
-            moon_item_key=str(s.get("moon_item_key") or "").strip() or None,
-            topic_name=str(s.get("topic_name") or sid),
-            anime_prefix=str(s.get("anime_prefix") or ""),
-            caption_file=str(s.get("caption_file") or ""),
-            download_dir=str(s.get("download_dir") or f"xiazai/downloads/{sid}"),
-            sort_order=int(s.get("sort_order") or i),
-        )
-        urls = s.get("urls")
-        if isinstance(urls, list) and urls:
-            sync_episode_urls_from_config(conn, sid, [str(u) for u in urls if str(u).strip()])
+        ch_id = str(ch.get("id") or "").strip()
+        for s in (ch.get("shows") or []):
+            if not isinstance(s, dict):
+                continue
+            sid = str(s.get("id") or "").strip()
+            if not sid:
+                continue
+            urls_file = str(s.get("urls_file") or "").strip()
+            upsert_show_profile(
+                conn,
+                show_id=sid,
+                topic_name=str(s.get("topic_name") or sid),
+                anime_prefix=str(s.get("anime_prefix") or ""),
+                caption_file=str(s.get("caption_file") or ""),
+                download_dir=str(s.get("download_dir") or f"xiazai/downloads/{sid}"),
+                urls_file=urls_file,
+                sort_order=int(s.get("sort_order") or i),
+                channel_id=ch_id,
+            )
+            i += 1
+
+            # 从 txt 文件加载 URL
+            if urls_file:
+                txt_path = resolve_rel(root, urls_file)
+                episode_urls = _load_urls_from_txt(txt_path)
+                if episode_urls:
+                    for ep, url in episode_urls.items():
+                        conn.execute(
+                            """
+                            INSERT INTO episode_jobs (show_id, episode, url, download_status, upload_status, updated_at)
+                            VALUES (?,?,?,?,?,?)
+                            ON CONFLICT(show_id, episode) DO UPDATE SET
+                              url=excluded.url,
+                              updated_at=excluded.updated_at
+                            """,
+                            (sid, ep, url, "", "", utc_now_iso()),
+                        )
     conn.commit()
 
 
@@ -303,7 +366,11 @@ def run_download_upload(upload_enabled_override: bool | None = None) -> None:
     ensure_schema(cur)
     conn.commit()
 
-    seed_shows(conn, cfg)
+    seed_shows(conn, cfg, root)
+
+    # v2.0: 构建 show_id → telegram_chat_id 映射（多频道上传）
+    show_target_map, show_cover_map = _load_channel_target_map(cfg)
+    default_target = str((cfg.get("telegram") or {}).get("target") or "").strip()
 
     runtime = cfg.get("runtime") or {}
     upload_enabled = bool(runtime.get("upload_enabled", True))
@@ -318,22 +385,24 @@ def run_download_upload(upload_enabled_override: bool | None = None) -> None:
     download_use_clean_proxy = not bool((cfg.get("proxy") or {}).get("download", {}).get("enabled", False))
 
     xiazai_dir = root / "xiazai"
-    cover_path = resolve_cover(cfg, root)
 
     profiles = list_show_profiles(conn)
     if not profiles:
-        print("show_profiles 为空，请在 config.yaml 的 shows 下配置番剧。", file=sys.stderr)
+        print("show_profiles 为空，请在 config.yaml monitor 段配置频道和剧集。", file=sys.stderr)
         return
 
     print(
         f"数据库: {db_path}\n"
-        f"封面: {cover_path}\n"
         f"模式: {'下载+上传' if upload_enabled else '仅下载'}"
     )
 
     for prof in profiles:
         show_id = str(prof["show_id"])
         topic_name = str(prof["topic_name"])
+        # v2.0: 解析该剧上传目标（优先频道 target，回退全局 target）
+        show_target = show_target_map.get(show_id) or default_target or None
+        # 按频道封面（优先频道 cover，回退全局 paths.cover）
+        show_cover = resolve_cover(show_cover_map.get(show_id), cfg, root)
         anime_prefix = str(prof["anime_prefix"])
         cap_rel = str(prof["caption_file"])
         dl_rel = str(prof["download_dir"])
@@ -431,7 +500,8 @@ def run_download_upload(upload_enabled_override: bool | None = None) -> None:
                         upload_via_telegram_manager(
                             file_path=out_path,
                             caption=caption,
-                            thumb_path=cover_path,
+                            target=show_target,
+                            thumb_path=show_cover,
                             progress_callback=prog_cb,
                         )
                     )

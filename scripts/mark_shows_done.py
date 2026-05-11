@@ -206,17 +206,17 @@ def main() -> int:
                     upsert_show_profile(
                         conn,
                         show_id=sid,
-                        moon_item_key=str(row.get("moon_item_key") or "").strip() or None,
                         topic_name=str(row.get("topic_name") or sid),
                         anime_prefix=str(row.get("anime_prefix") or ""),
                         caption_file=str(row.get("caption_file") or ""),
                         download_dir=str(row.get("download_dir") or f"xiazai/downloads/{sid}"),
+                        urls_file=str(row.get("urls_file") or "").strip(),
                         sort_order=int(row.get("sort_order") or 0),
                     )
                     sync_episode_urls_from_config(conn, sid, url_list)
                 except sqlite3.IntegrityError as e:
                     print(
-                        f"{sid}: 写入 show_profiles / episode_jobs 失败（多为 moon_item_key 与其它番重复）。{e}",
+                        f"{sid}: 写入 show_profiles / episode_jobs 失败。{e}",
                         file=sys.stderr,
                     )
                     skipped_no_sync.add(sid)

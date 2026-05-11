@@ -14,7 +14,6 @@ if str(ROOT) not in sys.path:
 from app.config_loader import database_path, load_config
 from app.store import append_episode_urls, connect, ensure_schema
 from jiankong.m3u8_resolve import resolve_new_episode_m3u8_urls
-from jiankong.pipeline_config import load_item_key_to_show_id
 
 
 def pipeline_enabled() -> bool:
@@ -22,23 +21,14 @@ def pipeline_enabled() -> bool:
     return v in ("1", "true", "yes", "on")
 
 
-def _item_key_allowed(item_key: str) -> bool:
-    raw = (os.environ.get("PIPELINE_ITEM_KEYS") or "").strip()
-    if not raw:
-        return True
-    allowed = {x.strip() for x in raw.split(",") if x.strip()}
-    return item_key in allowed
-
 
 def run_pipeline_for_changes(changes: list[dict]) -> None:
-    if not pipeline_enabled() or not changes:
-        return
+    """v2.0: 接受 config_monitor 的变更字典。
 
-    mapping = load_item_key_to_show_id()
-    if not mapping:
-        logging.warning(
-            "PIPELINE_ENABLED 已开但未配置 ITEM_KEY_TO_SHOW_ID（jiankong/pipeline_config.py）"
-        )
+    变更字典格式: {show_id, channel_id, telegram_chat_id, search_keyword, title,
+                     display_name, old_total, new_total, source_name, source_id, vod_id}
+    """
+    if not pipeline_enabled() or not changes:
         return
 
     cfg = load_config()
@@ -46,35 +36,41 @@ def run_pipeline_for_changes(changes: list[dict]) -> None:
     conn = connect(db_path)
     cur = conn.cursor()
     ensure_schema(cur)
+    try:
+        from app.store import ensure_schema_v2
+        ensure_schema_v2(cur)
+    except ImportError:
+        pass
     conn.commit()
 
     modified = False
 
     for c in changes:
-        item_key = str(c.get("key") or "")
-        if not item_key or not _item_key_allowed(item_key):
-            continue
-        show_id = mapping.get(item_key)
+        show_id = str(c.get("show_id") or "")
+        channel_id = str(c.get("channel_id") or "")
+
         if not show_id:
-            logging.info("流水线跳过（未绑定 show_id）: %s", item_key)
             continue
 
         title = str(c.get("title") or "")
         display_name = str(c.get("display_name") or "") or title
+        search_kw = str(c.get("search_keyword") or "")
         source_name = str(c.get("source_name") or "")
         source_id = str(c.get("source_id") or "")
         vod_id = str(c.get("vod_id") or "")
+
         try:
-            old_total = int(c.get("oldTotal", 0))
-            new_total = int(c.get("newTotal", 0))
+            old_total = int(c.get("old_total") or c.get("oldTotal", 0))
+            new_total = int(c.get("new_total") or c.get("newTotal", 0))
         except (TypeError, ValueError):
             logging.error("变更条目集数无效: %s", c)
             continue
 
+        item_key = str(c.get("key") or f"{source_id}+{vod_id}")
         episode_urls = resolve_new_episode_m3u8_urls(
             item_key=item_key,
             title=title,
-            display_name=display_name,
+            display_name=search_kw or display_name,
             old_total=old_total,
             new_total=new_total,
             source_name=source_name,
@@ -82,7 +78,7 @@ def run_pipeline_for_changes(changes: list[dict]) -> None:
             vod_id=vod_id,
         )
         if not episode_urls:
-            logging.info("未得到 m3u8，跳过写入库: %s", display_name or item_key)
+            logging.info("未得到 m3u8，跳过写入库: %s", display_name or show_id)
             continue
 
         try:
@@ -97,7 +93,14 @@ def run_pipeline_for_changes(changes: list[dict]) -> None:
             logging.exception("写入 episode_jobs 失败 show_id=%s", show_id)
             continue
 
-        if written:
+        if written and channel_id:
+            for ep in written:
+                conn.execute(
+                    "UPDATE episode_jobs SET channel_id=? WHERE show_id=? AND episode=?",
+                    (channel_id, show_id, ep),
+                )
+            modified = True
+        elif written:
             modified = True
 
     conn.close()

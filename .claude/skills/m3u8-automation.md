@@ -1,158 +1,185 @@
 ---
 name: m3u8-automation
-description: 动漫监控自动化流水线：监控收藏→多供应商比较→解析m3u8→下载→上传Telegram(正确宽高比/视频气泡)→删除本地文件。可复用于其他动漫资源监控项目。
+description: 多频道动漫/影视监控自动化流水线：配置驱动多频道→搜索比对→解析m3u8→下载→上传对应频道(正确宽高比)→删除本地文件。可复用于其他动漫资源监控项目。
 ---
 
-# 动漫监控全自动流水线 Skill
+# 多频道监控全自动流水线 Skill (v3.0)
 
 ## 一、整体架构
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│  auto_run.py / favorites_notify.py --loop               │
-│  (定时器，默认30分钟)                                     │
-├─────────────────────────────────────────────────────────┤
-│  ① 监控层: favorites_notify.py                          │
-│     └─ GET /api/favorites → SQLite 比对 → 发现变更       │
-│     └─ provider_compare.py: 多供应商同动漫比较，取最高集数  │
-├─────────────────────────────────────────────────────────┤
-│  ② 解析层: pipeline.py → m3u8_resolve.py                 │
-│     └─ /api/search → 匹配 source_name → 读取 episodes    │
-│     └─ 输出: {集数: m3u8_url} → 写入 episode_jobs 表     │
-├─────────────────────────────────────────────────────────┤
-│  ③ 下载层: download_worker.py                           │
-│     └─ N_m3u8DL-RE 子进程 (m3u8 → mp4)                  │
-│     └─ 文件存在性校验 + 异常边界处理                       │
-│     └─ 状态写入 SQLite (download_status)                 │
-├─────────────────────────────────────────────────────────┤
-│  ④ 上传层: telegram_manager.py                          │
-│     └─ ffprobe 提取宽/高/时长 → DocumentAttributeVideo   │
-│     └─ Telethon send_file (视频气泡 + 流式播放)           │
-│     └─ FastTelethon 并行分片 (parallel=true 时启用)      │
-│     └─ 上传完成 → 标记 upload_status → 删除本地 mp4       │
-└─────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│  auto_run.py / config_monitor.py --loop                       │
+│  (定时器，默认30分钟，支持 --channel 频道过滤)                    │
+├──────────────────────────────────────────────────────────────┤
+│  ① 监控层: jiankong/config_monitor.py                         │
+│     └─ 读取 config.yaml monitor.channels 配置                  │
+│     └─ 遍历频道→剧集: search_keyword 调用 provider_compare     │
+│     └─ 与 SQLite show_monitor_state 比对集数                   │
+│     └─ 有变更 → 发送 Telegram Bot 通知（按频道分组）            │
+├──────────────────────────────────────────────────────────────┤
+│  ② 解析层: jiankong/pipeline.py → m3u8_resolve.py             │
+│     └─ /api/search → 匹配 source_name → 读取 episodes          │
+│     └─ 输出: {集数: m3u8_url} → 写入 episode_jobs 表           │
+├──────────────────────────────────────────────────────────────┤
+│  ③ 下载层: app/download_worker.py                             │
+│     └─ 从 data/urls/<channel>/<show>.txt 加载手动 URL          │
+│     └─ N_m3u8DL-RE 子进程 (m3u8 → mp4)                        │
+│     └─ 构建 show_id → (telegram_chat_id, cover) 映射表        │
+├──────────────────────────────────────────────────────────────┤
+│  ④ 上传层: telegram_manager.py                                │
+│     └─ ffprobe 提取宽/高/时长 → DocumentAttributeVideo         │
+│     └─ 上传到对应频道的 chat_id，使用频道封面                   │
+│     └─ FastTelethon 并行分片 (parallel=true 时启用)            │
+│     └─ 上传完成 → 标记 upload_status → 删除本地 mp4            │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 ## 二、核心模块
 
-### 2.1 监控模块 (`jiankong/favorites_notify.py`)
+### 2.1 配置驱动监控 (`jiankong/config_monitor.py`)
+
+通过 config.yaml 定义频道和剧集，搜索 API 检测更新。
 
 ```python
-CONFIG = {
-    "BASE_URL": "https://xxx.xxx",
-    "FAVORITES_SCRIPT_TOKEN": "",       # Bearer 令牌（推荐）
-    "FAVORITES_SCRIPT_USERNAME": "",    # MoonTV 用户名
-    "TELEGRAM_BOT_TOKEN": "",           # 变更通知 Bot
-    "TELEGRAM_CHAT_ID": "",             # 通知接收 chat_id
-    "PIPELINE_ENABLED": "1",            # 启用自动下载上传
-    "M3U8_RESOLVER_MODE": "moon_tv",    # m3u8 解析模式
+run_monitor(config_path=None, *, channel_filter=None) -> int
+# ① 加载 config.yaml monitor.channels
+# ② 遍历 channel → show: search_keyword → provider_compare.search_all_providers()
+# ③ 与 SQLite show_monitor_state.last_episode_count 比对
+# ④ 有变更 → 记录 changes 列表 → 发送 Telegram 通知 → 触发 pipeline
+
+main() -> int
+# CLI: --loop, --interval, --channel, --once
+```
+
+**变更字典格式**：
+```python
+{
+    "show_id": str, "channel_id": str, "telegram_chat_id": str,
+    "search_keyword": str, "title": str, "display_name": str,
+    "old_total": int, "new_total": int,
+    "source_name": str, "source_id": str, "vod_id": str,
 }
-
-run() -> int                            # 单次检查
-main() -> int                           # CLI 入口，支持 --loop --interval
 ```
 
-**认证机制**：推荐 Bearer Token（服务端需配置同名环境变量），回退 Cookie。
-
-### 2.2 多供应商比较 (`jiankong/provider_compare.py`)
-
-同一动漫在不同供应商有不同的 source_id → 按 display_name 分组 → 搜索所有供应商 → 取最高集数。解决各供应商更新速度不一致的问题。
-
-```python
-compare_and_get_max_episodes(favorites_data, alias_map) -> dict[str, dict]
-# 返回: {display_name: {"key": str, "total": int, "source_name": str, ...}}
-```
-
-### 2.3 流水线 (`jiankong/pipeline.py`)
+### 2.2 流水线 (`jiankong/pipeline.py`)
 
 ```python
 run_pipeline_for_changes(changes: list[dict]) -> None
-# ① 遍历变更 → m3u8_resolve 解析新集 m3u8 URL
-# ② 写入 episode_jobs 表（download_status='pending'）
-# ③ 直接调用 run_download_upload(upload_enabled_override=True)
-
-load_item_key_to_show_id() -> dict[str, str]  # item_key → show_id 映射
+# 变更字典直接包含 show_id、channel_id、telegram_chat_id
+# 写入 episode_jobs 时携带 channel_id
+# 调用 run_download_upload(upload_enabled_override=True)
 ```
 
-### 2.4 下载模块 (`app/download_worker.py`)
+环境变量控制：
+```bash
+PIPELINE_ENABLED=1              # 启用自动下载上传
+PIPELINE_SKIP_XIAZAI=1          # 只解析 m3u8，不下载上传
+```
+
+### 2.3 多供应商比较 (`jiankong/provider_compare.py`)
+
+同一关键词在不同供应商有不同结果 → 按 display_name/title 分组 → 搜索所有供应商 → 取最高集数。
 
 ```python
+search_all_providers(keyword: str, base_url: str) -> list[dict]
+# 返回按集数降序排列的结果列表
+```
+
+### 2.4 下载模块 (`app/download_worker.py`) ← 多频道上传 + 频道封面
+
+```python
+seed_shows(conn, cfg, root) -> None
+# 从 config.monitor.channels[*].shows 读取剧集配置
+# 从 data/urls/<channel>/<show>.txt 加载手动 URL（一行一个，行号=集数）
+
 download_m3u8_re(url, out_path, dl_cfg, *, working_dir, clean_proxy)
 # → N_m3u8DL-RE 子进程下载，完成后校验文件存在
 
 run_download_upload(upload_enabled_override=None)
-# → 遍历 show_profiles → 检查 episode_jobs → 下载 + 上传
+# → 构建 show_id → (telegram_chat_id, cover_path) 映射
+# → 按频道 cover 上传，回退全局 paths.cover
+# → 遍历 show_profiles → 每剧解析上传目标 → 下载 + 上传到对应频道
 
 async upload_via_telegram_manager(file_path, caption, *,
     target, thumb_path, progress_callback) -> bool
-# → asyncio.run() 包装，每次调用独立 event loop
+# → 支持 target 参数，上传到指定 chat_id
 ```
 
-**下载要点**：
-- N_m3u8DL-RE 放在 `xiazai/` 或 PATH
-- 下载时清空代理环境变量（`_download_subprocess_env`）
-- 下载失败自动清理残骸文件 (`_delete_local_file`)
-
-**进度追踪**（v1.1 新增）：
-- `_count_planned_uploads()` — 预计算本轮上传总数，作为进度分母
-- `_make_show_upload_progress_cb()` — 单文件 + 本剧总进度双维度显示
+**URL txt 文件格式**（`data/urls/<channel>/<show>.txt`）：
+```
+# 一行一个 m3u8 URL，第 N 行 = 第 N 集
+https://example.com/ep1.m3u8
+https://example.com/ep2.m3u8
+              ← 空行表示该集无手动 URL
+https://example.com/ep4.m3u8
+```
 
 ### 2.5 Telegram 管理器 (`telegram_manager.py`)
 
 ```python
 class TelegramManager:
-    async login(force_relogin=False)        # session 优先 → API 接码 → 交互式
-    async upload_video(file_path, caption, *, thumb_path, progress_callback)
-    async update_profile(name, bio, avatar, username)
-    async join_groups(groups)
+    async login(force_relogin=False)
+    async upload_video(file_path, caption, *, thumb_path, target, progress_callback)
     async disconnect()
-
-# CLI
-python telegram_manager.py login
-python telegram_manager.py profile --name "xx" --bio "xx"
-python telegram_manager.py join --groups "@ch1,@ch2"
 ```
 
-**上传视频格式优化**（v1.1 核心改进）：
-
-```
-ffprobe 提取视频元信息
-  → width / height / duration
-  → 构建 DocumentAttributeVideo
-  → Telethon send_file(attributes=..., supports_streaming=True, force_document=False)
-  → Telegram 客户端展示为视频气泡（非文件附件）
-  → 正确显示时长、分辨率，可直接内联播放
-```
+**上传视频格式**：ffprobe → width/height/duration → DocumentAttributeVideo → 视频气泡（非文件附件）。
 
 **双路径上传**：
-| 路径 | 触发条件 | 特点 |
-|------|---------|------|
-| FastTelethon 并行 | `fastupload.parallel: true` + 已安装 FastTelethonhelper | 多连接分片上传（加速大文件） |
-| Telethon 内置 | 默认 | 单连接，稳定可靠，仍带正确视频属性 |
+| 路径 | 条件 | 特点 |
+|------|------|------|
+| FastTelethon 并行 | `fastupload.parallel: true` | 多连接分片（大文件加速） |
+| Telethon 内置 | 默认 | 单连接稳定，仍带视频属性 |
 
-**环境变量控制**：
+### 2.6 CLI 管理工具 (`manage_channels.py`)
+
+直接读写 config.yaml monitor 段 + txt 文件，支持频道/剧集/URL/状态管理：
+
 ```bash
-TELEGRAM_DISABLE_FAST_UPLOAD=1    # 强制走内置上传
-TELEGRAM_UPLOAD_CONNECTIONS=16    # 连接数
-TELEGRAM_FAST_MAX_CONNECTIONS=8   # 并行上限
+# 频道管理
+python manage_channels.py list-channels
+python manage_channels.py add-channel --id anime --name "动漫频道" --chat-id "-100xxx" --cover "covers/anime.jpeg"
+python manage_channels.py delete-channel --id anime
+
+# 剧集管理
+python manage_channels.py list-shows --channel anime
+python manage_channels.py add-show --channel anime --id test --search "关键词" --topic "名称" --urls-file "data/urls/anime/test.txt"
+python manage_channels.py edit-show --id test --search "新关键词"
+python manage_channels.py delete-show --id test
+
+# 手动 URL 管理（读写 txt 文件）
+python manage_channels.py add-url --show-id mushenji --ep 69 --url "https://..."
+python manage_channels.py remove-url --show-id mushenji --ep 69
+python manage_channels.py list-urls --show-id mushenji
+
+# 监控状态
+python manage_channels.py show-state --show-id mushenji
+python manage_channels.py reset-state --show-id mushenji --episode-count 0
 ```
 
-**辅助模块**：
-- `_stderr_upload_progress(label)` — 实时上传速度/百分比到 stderr
-- `_get_telethon_fast_upload_speed_module()` — 加载 Telethon-FastUpload 辅助脚本
-- `ft._infer_nosound_video(fp)` — ffprobe 检测无音轨
-- `ft._build_document_attributes(fp, thumb, nosound_hint)` — 构建视频属性（宽高比核心）
-
-### 2.6 SQLite 数据模型 (`app/store.py`)
+### 2.7 SQLite 数据模型 (`app/store.py`) ← v3.0
 
 ```sql
-fav_items (item_key TEXT PK, total_episodes INT, title TEXT, last_total INT)
-fav_display_names (item_key TEXT PK, display_name TEXT)
-show_profiles (show_id TEXT PK, moon_item_key TEXT UNIQUE, topic_name TEXT,
-               anime_prefix TEXT, caption_file TEXT, download_dir TEXT)
+-- 频道表
+channels (channel_id TEXT PK, channel_name TEXT, telegram_chat_id TEXT,
+          channel_type TEXT DEFAULT '', cover TEXT DEFAULT '', sort_order INT)
+
+-- 剧集配置
+show_profiles (show_id TEXT PK, topic_name TEXT, anime_prefix TEXT,
+               caption_file TEXT, download_dir TEXT, urls_file TEXT DEFAULT '',
+               sort_order INT)
+
+-- 待下载/上传任务
 episode_jobs (show_id TEXT, episode INT, url TEXT,
               download_status TEXT, upload_status TEXT, updated_at TEXT,
+              channel_id TEXT DEFAULT '',
               PRIMARY KEY (show_id, episode))
+
+-- 监控状态（搜索比对基线）
+show_monitor_state (show_id TEXT PK, channel_id TEXT, search_keyword TEXT,
+                    last_episode_count INT, source_name TEXT, source_id TEXT,
+                    vod_id TEXT, title TEXT, updated_at TEXT)
 ```
 
 **状态机**：
@@ -163,15 +190,21 @@ upload_status:   '' → uploaded / upload_failed
 
 ## 三、配置清单
 
-### config.yaml 完整结构
+### config.yaml 完整结构 (v3.0)
+
 ```yaml
 database:
   path: data/app_state.sqlite
 
 proxy:
+  download:
+    enabled: false
   upload:
     enabled: true
     socks5: { host: 127.0.0.1, port: 10809, username: '', password: '' }
+
+paths:
+  cover: Telethon-FastUpload/cover.jpeg          # 全局默认封面（频道未指定时使用）
 
 telegram:
   api_id: 'YOUR_API_ID'
@@ -180,48 +213,75 @@ telegram:
   session_path: Telethon-FastUpload/session.session
   phone: '+1xxxxxxxxx'
 
-# v1.1 新增：FastTelethon 上传加速配置
 fastupload:
-  enabled: true          # 启用 FastTelethon 模块
-  parallel: false        # 并行分片上传（默认关闭，需显式开启）
-  connections: 16        # 连接数（parallel=true 时生效）
+  enabled: true
+  parallel: false
+  connections: 16
 
 m3u8dl_re:
   executable: N_m3u8DL-RE
   auto_select: true
-  ffmpeg_binary_path: ''
   log_level: ERROR
 
 runtime:
   upload_enabled: true
   upload_retries: 5
 
-shows:
-  - id: panlong           # 与 pipeline_config 的 ITEM_KEY_TO_SHOW_ID 一致
-    moon_item_key: '23+81489'
-    topic_name: 盘龙
-    anime_prefix: 盘龙第
-    caption_file: Telethon-FastUpload/盘龙.txt
-    download_dir: xiazai/downloads/panlong
-    sort_order: 1
-    urls: [...]           # 可选：手动指定 m3u8 URL 列表
+# ===== v3.0 配置驱动多频道监控 =====
+monitor:
+  notify_bot_token: "YOUR_BOT_TOKEN"
+  notify_chat_id: "YOUR_CHAT_ID"
+  base_url: "https://tv.658877.xyz"
+  interval: 1800
+
+  channels:
+    - id: anime
+      name: "动漫频道"
+      telegram_chat_id: "-1003966238914"
+      cover: "covers/anime.jpeg"               # 频道封面图（可选，回退 paths.cover）
+      sort_order: 1
+      shows:
+        - id: mushenji
+          search_keyword: "牧神记"
+          topic_name: "牧神记"
+          anime_prefix: "牧神记第"
+          caption_file: "Telethon-FastUpload/牧神记.txt"
+          download_dir: "xiazai/downloads/mushenji"
+          urls_file: "data/urls/anime/牧神记.txt"   # 手动 URL txt 文件（一行一集）
+          sort_order: 1
+
+    - id: american_tv
+      name: "美剧频道"
+      telegram_chat_id: "-100xxx"
+      cover: "covers/american.jpeg"
+      sort_order: 2
+      shows: []
 ```
 
-### pipeline_config.py
-```python
-ITEM_KEY_TO_SHOW_ID = {
-    "23+81489": "panlong",       # MoonTV item_key → config.yaml shows[].id
-    "maotaizy+91": "mushenji",
-    ...
-}
+## 四、运行方式
+
+```bash
+# 循环监控
+python auto_run.py                         # 默认 30 分钟
+python auto_run.py --interval 600          # 每 10 分钟
+python auto_run.py --once                  # 单次检查
+python auto_run.py --channel anime         # 仅检查指定频道
+
+# 直接调用
+python jiankong/config_monitor.py --once
+python jiankong/config_monitor.py --loop --interval 1800
+
+# 仅下载上传（不监控）
+python run.py --upload
+python run.py --download
 ```
 
-## 四、服务端部署
+## 五、服务端部署
 
 ### systemd
 ```ini
 [Unit]
-Description=Anime Monitor Pipeline
+Description=Multi-Channel Monitor Pipeline v3.0
 After=network-online.target
 
 [Service]
@@ -231,12 +291,13 @@ ExecStart=/usr/bin/python3 auto_run.py --interval 1800
 Restart=always
 RestartSec=30
 Environment=PYTHONUNBUFFERED=1
+Environment=PIPELINE_ENABLED=1
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-### Docker 关键点
+### Docker
 ```dockerfile
 FROM python:3.11-slim
 RUN apt update && apt install -y ffmpeg ffprobe wget
@@ -248,46 +309,33 @@ CMD ["python", "auto_run.py", "--interval", "1800"]
 
 ### 服务端 checklist
 1. N_m3u8DL-RE 二进制放 `xiazai/` 目录
-2. ffmpeg + ffprobe 必须安装（下载合并 + 视频元信息提取）
-3. 本地 `python telegram_manager.py login` 生成 session，scp 到服务器
-4. config.yaml 不提交 git（在 .gitignore），手动部署
-5. 国内服务器需 SOCKS5 代理（`proxy.upload.socks5`）
+2. ffmpeg + ffprobe 必须安装
+3. `python telegram_manager.py login` 生成 session，scp 到服务器
+4. config.yaml 手动部署（含 monitor 段），不提交 git
+5. 国内服务器需 SOCKS5 代理
+6. URL txt 文件放在 `data/urls/<channel>/` 目录，一行一个 m3u8 链接
 
-## 五、复用到新项目的步骤
+## 六、复用到新项目的步骤
 
-1. **复制核心模块**：
-   ```
-   jiankong/favorites_notify.py   → 改 BASE_URL + API 格式
-   jiankong/provider_compare.py   → 适配新站点 API
-   jiankong/pipeline.py           → 改 m3u8 解析逻辑
-   jiankong/m3u8_resolve.py       → 注册新解析模式
-   app/download_worker.py         → 保持不变（复用 N_m3u8DL-RE）
-   app/store.py                   → 保持不变
-   telegram_manager.py            → 保持不变（session/上传/视频属性）
-   Telethon-FastUpload/           → 保持不变（FastTelethon 辅助模块）
-   ```
-
-2. **适配站点 API**：改 `favorites_notify.py` 的 `http_get_favorites()` 和 `moon_tv_m3u8.py` 的搜索解析
-
-3. **配置映射**：更新 `pipeline_config.py` → `config.yaml` shows 列表 → `favorites_notify.py` CONFIG
-
+1. **配置频道**：编辑 config.yaml monitor.channels，定义频道和剧集
+2. **管理剧集**：`python manage_channels.py add-show --channel xxx --id xxx --search "关键词" --urls-file "data/urls/xxx.txt"`
+3. **添加 URL**：`python manage_channels.py add-url --show-id xxx --ep 1 --url "https://..."`  或直接编辑 txt 文件
 4. **生成 session**：`python telegram_manager.py login`
+5. **测试**：`python auto_run.py --once` → 确认后 `python auto_run.py`
 
-5. **测试**：`python auto_run.py --once` → 确认无误后 `python auto_run.py`
-
-## 六、调试
+## 七、调试
 
 ```bash
-LOG_LEVEL=DEBUG python auto_run.py --once           # 详细日志
-PIPELINE_SKIP_XIAZAI=1 python auto_run.py --once    # 只解析 m3u8 不下载
-M3U8_RESOLVER_MODE=placeholder python auto_run.py --once  # 占位符调试
-PIPELINE_ITEM_KEYS="23+81489,maotaizy+91" python auto_run.py --once  # 白名单
-TELEGRAM_DISABLE_FAST_UPLOAD=1 python auto_run.py --once  # 强制内置上传
+LOG_LEVEL=DEBUG python auto_run.py --once
+PIPELINE_SKIP_XIAZAI=1 python auto_run.py --once     # 只解析不下载
+TELEGRAM_DISABLE_FAST_UPLOAD=1 python auto_run.py --once
 ```
 
-## 七、版本历史
+## 八、版本历史
 
 | 版本 | 日期 | 变更 |
 |------|------|------|
 | v1.0 | 2026-05-11 | 初版：监控→解析→下载→上传→删除 全自动化 |
-| v1.1 | 2026-05-12 | 上传视频注入宽高比/时长属性（DocumentAttributeVideo）；FastTelethon 并行上传；下载文件校验增强；上传进度双维度显示 |
+| v1.1 | 2026-05-12 | 上传视频注入宽高比/时长；FastTelethon 并行上传；下载文件校验增强；上传进度双维度 |
+| v2.0 | 2026-05-12 | 配置驱动多频道监控；移除 favorites API 依赖；config_monitor 搜索比对；manage_channels CLI 管理；多频道独立上传目标；SQLite schema 扩展 |
+| v3.0 | 2026-05-12 | URL 移至 txt 文件存储（一行一集）；移除 v1.1 完全兼容（favorites_notify / pipeline_config / --legacy）；按频道指定封面图；SQLite schema 清理（移除 fav_items / fav_display_names / moon_item_key） |

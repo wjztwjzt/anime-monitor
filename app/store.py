@@ -21,32 +21,15 @@ def ensure_schema(conn: sqlite3.Cursor) -> None:
     cur = conn
     cur.execute(
         """
-        CREATE TABLE IF NOT EXISTS fav_items (
-          item_key TEXT PRIMARY KEY,
-          total_episodes INTEGER NOT NULL,
-          title TEXT,
-          last_total INTEGER NOT NULL
-        )
-        """
-    )
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS fav_display_names (
-          item_key TEXT PRIMARY KEY,
-          display_name TEXT NOT NULL
-        )
-        """
-    )
-    cur.execute(
-        """
         CREATE TABLE IF NOT EXISTS show_profiles (
           show_id TEXT PRIMARY KEY,
-          moon_item_key TEXT UNIQUE,
           topic_name TEXT NOT NULL,
           anime_prefix TEXT NOT NULL,
           caption_file TEXT NOT NULL,
           download_dir TEXT NOT NULL,
-          sort_order INTEGER DEFAULT 0
+          urls_file TEXT DEFAULT '',
+          sort_order INTEGER DEFAULT 0,
+          channel_id TEXT DEFAULT ''
         )
         """
     )
@@ -59,10 +42,51 @@ def ensure_schema(conn: sqlite3.Cursor) -> None:
           download_status TEXT DEFAULT '',
           upload_status TEXT DEFAULT '',
           updated_at TEXT,
+          channel_id TEXT DEFAULT '',
           PRIMARY KEY (show_id, episode)
         )
         """
     )
+
+
+def ensure_schema_v2(cur: sqlite3.Cursor) -> None:
+    """v2.0 新增表 + 旧表补列（幂等）。"""
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS channels (
+          channel_id TEXT PRIMARY KEY,
+          channel_name TEXT NOT NULL,
+          telegram_chat_id TEXT NOT NULL,
+          channel_type TEXT DEFAULT '',
+          cover TEXT DEFAULT '',
+          sort_order INTEGER DEFAULT 0
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS show_monitor_state (
+          show_id TEXT PRIMARY KEY,
+          channel_id TEXT NOT NULL DEFAULT '',
+          search_keyword TEXT NOT NULL,
+          last_episode_count INTEGER NOT NULL DEFAULT 0,
+          source_name TEXT DEFAULT '',
+          source_id TEXT DEFAULT '',
+          vod_id TEXT DEFAULT '',
+          title TEXT DEFAULT '',
+          updated_at TEXT
+        )
+        """
+    )
+    for table, col_def in [
+        ("show_profiles", "channel_id TEXT DEFAULT ''"),
+        ("episode_jobs", "channel_id TEXT DEFAULT ''"),
+        ("channels", "cover TEXT DEFAULT ''"),
+    ]:
+        try:
+            cur.execute(f"ALTER TABLE {table} ADD COLUMN {col_def}")
+        except sqlite3.OperationalError:
+            pass
 
 
 def utc_now_iso() -> str:
@@ -73,33 +97,36 @@ def upsert_show_profile(
     conn: sqlite3.Connection,
     *,
     show_id: str,
-    moon_item_key: str | None,
     topic_name: str,
     anime_prefix: str,
     caption_file: str,
     download_dir: str,
+    urls_file: str = "",
     sort_order: int = 0,
+    channel_id: str = "",
 ) -> None:
     conn.execute(
         """
-        INSERT INTO show_profiles (show_id, moon_item_key, topic_name, anime_prefix, caption_file, download_dir, sort_order)
-        VALUES (?,?,?,?,?,?,?)
+        INSERT INTO show_profiles (show_id, topic_name, anime_prefix, caption_file, download_dir, urls_file, sort_order, channel_id)
+        VALUES (?,?,?,?,?,?,?,?)
         ON CONFLICT(show_id) DO UPDATE SET
-          moon_item_key=excluded.moon_item_key,
           topic_name=excluded.topic_name,
           anime_prefix=excluded.anime_prefix,
           caption_file=excluded.caption_file,
           download_dir=excluded.download_dir,
-          sort_order=excluded.sort_order
+          urls_file=excluded.urls_file,
+          sort_order=excluded.sort_order,
+          channel_id=excluded.channel_id
         """,
         (
             show_id,
-            moon_item_key or None,
             topic_name,
             anime_prefix,
             caption_file,
             download_dir,
+            urls_file,
             sort_order,
+            channel_id,
         ),
     )
 
@@ -203,4 +230,99 @@ def list_show_profiles(conn: sqlite3.Connection) -> list[sqlite3.Row]:
         conn.execute(
             "SELECT * FROM show_profiles ORDER BY sort_order, show_id"
         ).fetchall()
+    )
+
+
+# ---- v2.0: 频道 & 监控状态 CRUD ----
+
+
+def upsert_channel(
+    conn: sqlite3.Connection,
+    *,
+    channel_id: str,
+    channel_name: str,
+    telegram_chat_id: str,
+    channel_type: str = "",
+    cover: str = "",
+    sort_order: int = 0,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO channels (channel_id, channel_name, telegram_chat_id, channel_type, cover, sort_order)
+        VALUES (?,?,?,?,?,?)
+        ON CONFLICT(channel_id) DO UPDATE SET
+          channel_name=excluded.channel_name,
+          telegram_chat_id=excluded.telegram_chat_id,
+          channel_type=excluded.channel_type,
+          cover=excluded.cover,
+          sort_order=excluded.sort_order
+        """,
+        (channel_id, channel_name, telegram_chat_id, channel_type, cover, sort_order),
+    )
+
+
+def delete_channel(conn: sqlite3.Connection, channel_id: str) -> None:
+    conn.execute("DELETE FROM channels WHERE channel_id=?", (channel_id,))
+
+
+def list_channels(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return list(
+        conn.execute("SELECT * FROM channels ORDER BY sort_order, channel_id").fetchall()
+    )
+
+
+def get_channel_by_id(conn: sqlite3.Connection, channel_id: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM channels WHERE channel_id=?", (channel_id,)
+    ).fetchone()
+
+
+def upsert_show_monitor_state(
+    conn: sqlite3.Connection,
+    *,
+    show_id: str,
+    channel_id: str = "",
+    search_keyword: str,
+    last_episode_count: int = 0,
+    source_name: str = "",
+    source_id: str = "",
+    vod_id: str = "",
+    title: str = "",
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO show_monitor_state (show_id, channel_id, search_keyword, last_episode_count, source_name, source_id, vod_id, title, updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(show_id) DO UPDATE SET
+          channel_id=excluded.channel_id,
+          search_keyword=excluded.search_keyword,
+          last_episode_count=excluded.last_episode_count,
+          source_name=excluded.source_name,
+          source_id=excluded.source_id,
+          vod_id=excluded.vod_id,
+          title=excluded.title,
+          updated_at=excluded.updated_at
+        """,
+        (show_id, channel_id, search_keyword, last_episode_count, source_name, source_id, vod_id, title, utc_now_iso()),
+    )
+
+
+def get_show_monitor_state(conn: sqlite3.Connection, show_id: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM show_monitor_state WHERE show_id=?", (show_id,)
+    ).fetchone()
+
+
+def list_show_monitor_states(
+    conn: sqlite3.Connection, channel_id: str | None = None
+) -> list[sqlite3.Row]:
+    if channel_id:
+        return list(
+            conn.execute(
+                "SELECT * FROM show_monitor_state WHERE channel_id=? ORDER BY show_id",
+                (channel_id,),
+            ).fetchall()
+        )
+    return list(
+        conn.execute("SELECT * FROM show_monitor_state ORDER BY channel_id, show_id").fetchall()
     )
