@@ -26,7 +26,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib.util
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import Any, Optional
@@ -41,6 +43,60 @@ from app.paths import project_root  # noqa: E402
 from app.proxy_util import build_socks5_url  # noqa: E402
 
 logger = logging.getLogger(__name__)
+
+_clou_ft_speed_mod: Any = None
+
+
+def _stderr_upload_progress(label: str, *, min_interval_sec: float = 0.2) -> Any:
+    """上传进度打到 stderr 并 flush，避免 stdout 缓冲 / IDE 不刷新。"""
+
+    import time
+
+    start = time.monotonic()
+    last = start
+    last_bytes = 0
+
+    def cb(current: int, total: int) -> None:
+        nonlocal last, last_bytes
+        now = time.monotonic()
+        if now - last < min_interval_sec and current != total:
+            return
+        total = total or 1
+        file_pct = 100.0 * current / total
+        dt = now - last
+        db = current - last_bytes
+        mb = 1024 * 1024
+        inst = (db / mb) / dt if dt > 0 else 0.0
+        line = (
+            f"\r[上传] {label[:48]}  {current / mb:7.2f}/{total / mb:7.2f} MB  "
+            f"{file_pct:5.1f}%  {inst:5.2f} MB/s"
+        )
+        sys.stderr.write(line)
+        sys.stderr.flush()
+        last = now
+        last_bytes = current
+        if current >= total:
+            sys.stderr.write("\n")
+            sys.stderr.flush()
+
+    return cb
+
+
+def _get_telethon_fast_upload_speed_module() -> Any:
+    """加载 Telethon-FastUpload/Telethon_FastUpload_speed.py（同目录名含连字符，不用常规包导入）。"""
+    global _clou_ft_speed_mod
+    if _clou_ft_speed_mod is not None:
+        return _clou_ft_speed_mod
+    script = PROJECT_ROOT / "Telethon-FastUpload" / "Telethon_FastUpload_speed.py"
+    if not script.is_file():
+        raise FileNotFoundError(f"缺少上传辅助模块: {script}")
+    spec = importlib.util.spec_from_file_location("clou_telethon_fast_upload_speed", script)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"无法解析模块: {script}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    _clou_ft_speed_mod = mod
+    return mod
 
 
 def _ensure_logging() -> None:
@@ -418,16 +474,25 @@ class TelegramManager:
         progress_callback: callable | None = None,
     ) -> Any:
         """
-        上传视频到 Telegram 频道/群组。
+        上传视频到 Telegram 频道/群组（大图视频气泡 + 可流媒体播放）。
+
+        - 使用 ffprobe 写入 DocumentAttributeVideo（时长/分辨率），避免客户端显示 00:00 或「文件」样式。
+        - 若已安装 FastTelethonhelper + FastTelethon，默认走多连接分片上传；否则回退 Telethon 内置上传。
+        - 未传入 progress_callback 时，在 stderr 打印单文件上传百分比与速度（立即 flush）。
+        - FastTelethon 并行上传仅在 config.yaml 里 fastupload.parallel 显式为 true 时启用（默认关闭，避免长时间卡住）。
+
+        环境变量:
+          TELEGRAM_DISABLE_FAST_UPLOAD=1 — 强制不用并行分片（仍带正确视频属性）。
+          TELEGRAM_UPLOAD_CONNECTIONS — 并行连接数（整数）；未设则用 config.yaml 的 fastupload.connections。
+          TELEGRAM_FAST_MAX_CONNECTIONS — 并行模式最大连接数（默认 8）。
 
         target: 目标频道/群组（如 '-1003966238914'），留空则使用 config.yaml 中的 target。
         caption: 视频文案（支持多行）。
         thumb_path: 封面图路径，留空则使用 config.yaml 中的 paths.cover。
         """
-        from telethon.tl import types as tl_types
-
         client = self.client
         cfg = self._cfg
+        ft = _get_telethon_fast_upload_speed_module()
 
         # 目标
         if not target:
@@ -444,7 +509,7 @@ class TelegramManager:
             raise FileNotFoundError(f"视频文件不存在: {fp}")
 
         # 封面
-        thumb = None
+        thumb: str | None = None
         if thumb_path:
             tp = Path(thumb_path)
             if not tp.is_absolute():
@@ -462,55 +527,119 @@ class TelegramManager:
             int(target) if target.lstrip("-").isdigit() else target
         )
 
-        logger.info("上传: %s -> %s", fp.name, target)
-
-        # 使用 Telethon 内置上传（视频可 inline 播放）
-        kwargs: dict[str, Any] = dict(
-            entity=target_entity,
-            file=str(fp),
-            caption=caption or None,
-            supports_streaming=True,
-            force_document=False,
-            progress_callback=progress_callback,
+        nosound = ft._infer_nosound_video(fp)
+        attributes, mime_guess = ft._build_document_attributes(
+            fp, thumb, nosound_hint=nosound
         )
-        if thumb:
-            kwargs["thumb"] = thumb
 
-        # 检测音轨
-        nosound = self._check_nosound(fp)
-        if nosound is not None:
-            kwargs["nosound_video"] = nosound
+        connections: int | None = None
+        env_c = (os.environ.get("TELEGRAM_UPLOAD_CONNECTIONS") or "").strip()
+        if env_c.isdigit() and int(env_c) > 0:
+            connections = int(env_c)
+        else:
+            fu0 = cfg.get("fastupload") if isinstance(cfg.get("fastupload"), dict) else {}
+            c = fu0.get("connections")
+            if c is not None:
+                try:
+                    ic = int(c)
+                    if ic > 0:
+                        connections = ic
+                except (TypeError, ValueError):
+                    pass
 
-        msg = await client.send_file(**kwargs)
+        fu = cfg.get("fastupload") if isinstance(cfg.get("fastupload"), dict) else {}
+        fast_disabled_env = (os.environ.get("TELEGRAM_DISABLE_FAST_UPLOAD") or "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        fu_enabled = str(fu.get("enabled", "true")).strip().lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        )
+        fu_parallel = fu.get("parallel")
+        if fu_parallel is None:
+            parallel_ok = False
+        elif isinstance(fu_parallel, bool):
+            parallel_ok = fu_parallel
+        else:
+            parallel_ok = str(fu_parallel).strip().lower() not in (
+                "0",
+                "false",
+                "no",
+                "off",
+            )
+        use_fast = (
+            fu_enabled
+            and parallel_ok
+            and not fast_disabled_env
+            and ft._fasttelethon_available()
+        )
+
+        if use_fast and connections is not None:
+            cap_raw = (os.environ.get("TELEGRAM_FAST_MAX_CONNECTIONS") or "8").strip()
+            try:
+                cap = int(cap_raw)
+                if cap > 0:
+                    connections = min(connections, cap)
+            except ValueError:
+                connections = min(connections, 8)
+
+        prog_cb = progress_callback
+        if prog_cb is None:
+            prog_cb = _stderr_upload_progress(fp.name)
+
+        logger.info("上传: %s -> %s (fast_parallel=%s)", fp.name, target, use_fast)
+
+        if use_fast:
+            tgfile = await ft.fasttelethon_upload_file_tuned(
+                client=client,
+                file_path=fp,
+                progress_callback=prog_cb,
+                connections=connections,
+            )
+            msg = await ft._send_parallel_video_document(
+                client=client,
+                target=target_entity,
+                path=fp,
+                tgfile=tgfile,
+                thumb_path=thumb,
+                caption=caption or "",
+                attributes=attributes,
+                mime_guess=mime_guess,
+                nosound=nosound,
+            )
+        else:
+            if not fast_disabled_env and fu_enabled and parallel_ok and not ft._fasttelethon_available():
+                logger.warning(
+                    "未安装 FastTelethonhelper/FastTelethon，使用内置上传。"
+                    " 安装后可加速: pip install FastTelethonhelper>=1.0.7"
+                )
+
+            def _prog(current: int, total: int) -> None:
+                if prog_cb:
+                    try:
+                        prog_cb(current, total)
+                    except Exception:
+                        pass
+
+            msg = await client.send_file(
+                target_entity,
+                str(fp),
+                caption=caption or None,
+                progress_callback=_prog,
+                supports_streaming=True,
+                force_document=False,
+                attributes=attributes,
+                thumb=thumb,
+                nosound_video=nosound,
+            )
+
         logger.info("上传完成: %s", fp.name)
         return msg
-
-    @staticmethod
-    def _check_nosound(file_path: Path) -> bool | None:
-        """检测视频是否有音轨。"""
-        import shutil
-        import subprocess
-
-        ffprobe = shutil.which("ffprobe")
-        if not ffprobe:
-            return None
-        try:
-            r = subprocess.run(
-                [
-                    ffprobe, "-v", "error",
-                    "-select_streams", "a",
-                    "-show_entries", "stream=codec_type",
-                    "-of", "csv=p=0",
-                    str(file_path),
-                ],
-                capture_output=True, text=True, timeout=120,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            return None
-        if r.returncode != 0:
-            return None
-        has_audio = bool([ln for ln in (r.stdout or "").splitlines() if ln.strip()])
-        return False if has_audio else True
 
     # ---- 资料修改 ----
 

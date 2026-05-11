@@ -1,6 +1,6 @@
 """
-多番剧下载 + FastUpload 上传；分集状态读写 SQLite（app/store.py）。
-下载不走代理；上传通过 TELEGRAM_PROXY=socks5（见 config.yaml proxy.upload）。
+多番剧下载 + Telegram 上传（Telethon + 可选 FastTelethon 分片）；分集状态读写 SQLite（app/store.py）。
+下载不走代理；上传走 config.yaml proxy.upload（socks5）。
 """
 
 from __future__ import annotations
@@ -71,6 +71,68 @@ def build_upload_caption(template: str, episode: int, topic_name: str) -> str:
 
 def episode_filename(anime_prefix: str, episode: int) -> str:
     return f"{anime_prefix}{episode}集.mp4"
+
+
+def _count_planned_uploads(
+    rows: list[Any],
+    download_dir: Path,
+    anime_prefix: str,
+    upload_enabled: bool,
+) -> int:
+    """本剧本轮可能上传的集数（用于总进度分母；含尚未下载的集）。"""
+    if not upload_enabled:
+        return 0
+    n = 0
+    for row in rows:
+        url = (row["url"] or "").strip()
+        if not url:
+            continue
+        if str(row["upload_status"] or "") == "uploaded":
+            continue
+        ds = str(row["download_status"] or "")
+        ep = int(row["episode"])
+        op = download_dir / episode_filename(anime_prefix, ep)
+        if ds == "downloaded" and not op.is_file():
+            continue
+        n += 1
+    return n
+
+
+def _make_show_upload_progress_cb(
+    *,
+    show_id: str,
+    topic_name: str,
+    ep: int,
+    slot: int,
+    n_planned: int,
+    file_label: str,
+) -> Any:
+    """单文件 + 本剧多集上传总进度（按集加权），输出到 stderr 并 flush。"""
+    if n_planned <= 0:
+        return None
+
+    last_t = [0.0]
+
+    def cb(current: int, total: int) -> None:
+        now = time.monotonic()
+        total = total or 1
+        if now - last_t[0] < 0.15 and current < total:
+            return
+        last_t[0] = now
+        file_pct = 100.0 * current / total
+        overall = 100.0 * (slot + current / total) / n_planned
+        mb = 1024 * 1024
+        sys.stderr.write(
+            f"\r  [{show_id}] {topic_name} 第{ep}集  文件{file_pct:5.1f}%  "
+            f"本剧总进度{overall:5.1f}% ({slot + 1}/{n_planned})  "
+            f"{current / mb:.1f}/{total / mb:.1f} MB  {file_label[:30]}"
+        )
+        sys.stderr.flush()
+        if current >= total:
+            sys.stderr.write("\n")
+            sys.stderr.flush()
+
+    return cb
 
 
 def _resolve_m3u8dl_executable(configured: str, xiazai_dir: Path) -> str:
@@ -293,6 +355,9 @@ def run_download_upload(upload_enabled_override: bool | None = None) -> None:
 
         print(f"\n=== {show_id} ({topic_name}) 共 {len(rows)} 条分集记录 ===")
 
+        n_upload_planned = _count_planned_uploads(rows, download_dir, anime_prefix, upload_enabled)
+        upload_slot = 0
+
         for row in rows:
             ep = int(row["episode"])
             url = (row["url"] or "").strip()
@@ -349,8 +414,17 @@ def run_download_upload(upload_enabled_override: bool | None = None) -> None:
                 caption = f"🎬 {topic_name}第{ep}集"
 
             ok = False
+            prog_cb = _make_show_upload_progress_cb(
+                show_id=show_id,
+                topic_name=topic_name,
+                ep=ep,
+                slot=upload_slot,
+                n_planned=n_upload_planned,
+                file_label=out_path.name,
+            )
+            upload_slot += 1
             for attempt in range(1, upload_retries + 1):
-                print(f"  upload ep{ep} (attempt {attempt})")
+                print(f"  upload ep{ep} (attempt {attempt})", flush=True)
                 try:
                     import asyncio
                     ok = asyncio.run(
@@ -358,6 +432,7 @@ def run_download_upload(upload_enabled_override: bool | None = None) -> None:
                             file_path=out_path,
                             caption=caption,
                             thumb_path=cover_path,
+                            progress_callback=prog_cb,
                         )
                     )
                     if ok:
@@ -387,6 +462,7 @@ async def upload_via_telegram_manager(
     *,
     target: str | None = None,
     thumb_path: Path | None = None,
+    progress_callback: Any = None,
 ) -> bool:
     """
     使用统一 TelegramManager 直接上传（不走子进程）。
@@ -402,6 +478,7 @@ async def upload_via_telegram_manager(
             caption=caption,
             target=target,
             thumb_path=str(thumb_path) if thumb_path else None,
+            progress_callback=progress_callback,
         )
         return True
     except Exception as e:

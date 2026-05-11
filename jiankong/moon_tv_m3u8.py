@@ -211,7 +211,7 @@ def resolve_new_episodes_m3u8(
         return {}
 
     # === 多提供商搜索：使用 provider_compare 找到最佳提供商 ===
-    from jiankong.provider_compare import search_all_providers
+    from jiankong.provider_compare import _extract_source_name, search_all_providers
 
     providers = search_all_providers(q, base_url)
     if not providers:

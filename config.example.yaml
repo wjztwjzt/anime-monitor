@@ -30,6 +30,9 @@ telegram:
   phone: '+1xxxxxxxxx'
 
 fastupload:
+  enabled: true
+  # parallel: true 时才用 FastTelethon 多连接分片（易在部分网络卡住；默认不写即为关）
+  parallel: false
   connections: 16
 
 runtime:

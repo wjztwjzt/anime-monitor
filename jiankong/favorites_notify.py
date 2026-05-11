@@ -419,12 +419,38 @@ def run() -> int:
     changes: list[dict[str, Any]] = []
     items_seen = len(data)
 
-    # 创建以 item_key 索引的旧集数映射
+    # 以 item_key 索引的本地「已确认最高集」基准：两列取 min，避免只改 last_total 不生效
     old_total_map: dict[str, int] = {}
     for row_old in cur.execute("SELECT item_key, total_episodes, last_total FROM fav_items").fetchall():
-        old_total_map[row_old[0]] = int(row_old[1])
+        te = int(row_old[1])
+        lt = int(row_old[2])
+        old_total_map[row_old[0]] = min(te, lt)
+        if te != lt:
+            logging.debug(
+                "fav_items 集数列不一致 item_key=%s total_episodes=%s last_total=%s（比对用 min=%s）",
+                row_old[0],
+                te,
+                lt,
+                old_total_map[row_old[0]],
+            )
 
     for display_name, best in grouped.items():
+        group_entries: list[dict[str, Any]] = list(best.get("_group_entries") or [])
+        if not group_entries:
+            group_entries = [
+                {
+                    "key": best["key"],
+                    "title": best.get("title") or "",
+                    "total": best["total"],
+                    "source_name": best.get("source_name") or "",
+                    "source_id": best.get("source_id") or "",
+                    "vod_id": best.get("vod_id") or "",
+                }
+            ]
+        group_keys = [e["key"] for e in group_entries]
+        olds_in_group = [old_total_map[k] for k in group_keys if k in old_total_map]
+        old = max(olds_in_group) if olds_in_group else None
+
         item_key = best["key"]
         title = best["title"]
         total = best["total"]
@@ -432,18 +458,25 @@ def run() -> int:
         source_id = best["source_id"]
         vod_id = best["vod_id"]
 
-        old = old_total_map.get(item_key)
         if old is None:
-            # 新条目：基线入库
-            cur.execute(
-                """INSERT INTO fav_items (item_key, total_episodes, title, last_total)
-                   VALUES (?,?,?,?)""",
-                (item_key, total, title, total),
-            )
-            logging.info("基线入库（不发通知）: %s total=%s", item_key, total)
+            # 新条目：整组基线入库（多提供商同一备注名可能有多条 item_key）
+            for e in group_entries:
+                ik = str(e["key"])
+                et = int(e["total"])
+                t_i = str(e.get("title") or "")
+                cur.execute(
+                    """INSERT INTO fav_items (item_key, total_episodes, title, last_total)
+                       VALUES (?,?,?,?)
+                       ON CONFLICT(item_key) DO UPDATE SET
+                         total_episodes = excluded.total_episodes,
+                         title = excluded.title,
+                         last_total = excluded.last_total""",
+                    (ik, et, t_i, et),
+                )
+                logging.info("基线入库（不发通知）: %s total=%s", ik, et)
             continue
 
-        # 检查是否所有提供商的最高集数超过了旧记录
+        # 检查该备注名分组在 API 上的最高集数是否高于本机任一条收藏 key 的基准
         if total != old:
             changes.append(
                 {
@@ -457,15 +490,25 @@ def run() -> int:
                     "vod_id": vod_id,
                 }
             )
-            cur.execute(
-                """UPDATE fav_items SET total_episodes = ?, title = ?, last_total = ?
-                   WHERE item_key = ?""",
-                (total, title, total, item_key),
-            )
+            for e in group_entries:
+                ik = str(e["key"])
+                t_i = str(e.get("title") or title or "")
+                cur.execute(
+                    """INSERT INTO fav_items (item_key, total_episodes, title, last_total)
+                       VALUES (?,?,?,?)
+                       ON CONFLICT(item_key) DO UPDATE SET
+                         total_episodes = excluded.total_episodes,
+                         title = excluded.title,
+                         last_total = excluded.last_total""",
+                    (ik, total, t_i, total),
+                )
             logging.info(
-                "集数变化（多提供商最高）: %s | %s → %s (provider=%s)",
-                title or item_key, old, total,
+                "集数变化（多提供商最高）: %s | %s → %s (provider=%s; keys=%s)",
+                title or item_key,
+                old,
+                total,
                 source_name or source_id or "unknown",
+                ",".join(group_keys),
             )
 
     conn.commit()

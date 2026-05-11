@@ -216,11 +216,13 @@ def compare_and_get_max_episodes(
             groups[display] = []
         groups[display].append(entry)
 
-    # 第二步：每组取最高集数
+    # 第二步：每组取最高集数（附带整组条目，供 fav_items 按多 key 对齐）
     result: dict[str, dict[str, Any]] = {}
     for display, entries in groups.items():
         best = max(entries, key=lambda e: e["total"])
-        result[display] = best
+        merged = dict(best)
+        merged["_group_entries"] = list(entries)
+        result[display] = merged
 
         if len(entries) > 1:
             logging.info(

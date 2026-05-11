@@ -9,7 +9,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
@@ -80,15 +80,15 @@ def _make_progress_printer(label: str, min_interval_sec: float = 0.5):
         inst = (db / MB) / dt if dt > 0 else 0.0
         avg = (current / MB) / (now - start) if now > start else 0.0
         percent = (current / total * 100) if total else 0.0
-        sys.stdout.write(
+        sys.stderr.write(
             f"\r{label} {current / MB:8.2f}/{total / MB:8.2f} MB {percent:6.2f}% inst {inst:6.2f} MB/s avg {avg:6.2f} MB/s"
         )
-        sys.stdout.flush()
+        sys.stderr.flush()
         last = now
         last_bytes = current
         if current == total:
-            sys.stdout.write("\n")
-            sys.stdout.flush()
+            sys.stderr.write("\n")
+            sys.stderr.flush()
 
     return cb
 
@@ -402,7 +402,7 @@ async def _send_parallel_video_document(
     attributes,
     mime_guess: Optional[str],
     nosound: Optional[bool],
-) -> None:
+) -> Any:
     mime_type = _normalize_video_mime(path, mime_guess)
     thumb_handle = None
     if thumb_path:
@@ -418,7 +418,7 @@ async def _send_parallel_video_document(
         force_file=False,
         nosound_video=nv,
     )
-    await client.send_file(target, media, caption=caption)
+    return await client.send_file(target, media, caption=caption)
 
 
 async def upload_video_with_fallback(
