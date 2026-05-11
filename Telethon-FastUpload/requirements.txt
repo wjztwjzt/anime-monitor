@@ -1,0 +1,5 @@
+telethon>=1.36.0
+python-dotenv>=1.0.0
+# FastTelethonhelper 为可选加速依赖；在 Windows 上常因 tgcrypto 需 MSVC 而安装失败。
+# 上传脚本 Telethon_FastUpload_speed.py 在未安装时会自动使用 Telethon 内置上传。
+# 若已安装 Visual C++ Build Tools，可手动：pip install FastTelethonhelper>=1.0.7

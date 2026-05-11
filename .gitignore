@@ -1,0 +1,68 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# 虚拟环境
+venv/
+env/
+.venv/
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 项目数据
+*.sqlite
+*.sqlite3
+*.db
+*.session
+*.session-journal
+Telethon-FastUpload/session.session
+sessions/
+
+# 下载的视频
+xiazai/downloads/
+downloads/
+*.mp4
+*.mkv
+*.ts
+*.m4v
+
+# 敏感配置
+.env
+.env.local
+config.yaml
+Telethon-FastUpload/.env
+cookies.txt
+账号列表.txt
+*.token
+credentials.json
+
+# 嵌套 git 仓库
+Telethon-FastUpload/.git/
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# 日志
+*.log
+
+# N_m3u8DL-RE 可执行文件
+xiazai/N_m3u8DL-RE*
+!xiazai/N_m3u8DL-RE/README*
+
+# 临时文件
+tmp/
+temp/
+*.tmp

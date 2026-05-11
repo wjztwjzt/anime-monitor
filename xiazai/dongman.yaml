@@ -1,0 +1,5 @@
+# 已迁移到项目根目录 config.yaml（多部番剧、统一数据库）。
+# 历史遗留：仅作说明；请勿再编辑本文件作为数据源。
+#
+# 请编辑: ../config.yaml
+# 数据库: 见 config.yaml -> database.path（默认 data/app_state.sqlite）

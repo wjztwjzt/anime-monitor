@@ -1,0 +1,2 @@
+# 每行对应一个账号；同一行里多个群/频道用逗号隔开（英文 , 或中文全角逗号 ， 均可）
+# 示例： https://t.me/+xxxx,@somegroup,https://t.me/joinchat/yyyy

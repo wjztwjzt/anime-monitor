@@ -1,0 +1,9 @@
+PyYAML>=6.0
+requests>=2.28.0
+python-dotenv>=1.0.0
+telethon>=1.36.0
+python-socks>=2.5.1
+aiohttp>=3.8.0
+# 上传加速（可选）：pip install FastTelethonhelper>=1.0.7
+# Windows 可能需安装「Microsoft C++ Build Tools」，否则会因 tgcrypto 编译失败。
+# 未安装时 Telethon-FastUpload/Telethon_FastUpload_speed.py 会自动用 Telethon 内置上传（较慢）。
