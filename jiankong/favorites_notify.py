@@ -55,9 +55,9 @@ CONFIG: dict[str, str] = {
     # 状态库：绝对路径，或相对脚本目录；留空 → 脚本目录/moontv_favorites_state.sqlite
     "FAVORITES_SQLITE_DB": "",
     "MOONTV_USER_LABEL": "",
-    # 自动化：集数变更并通知后，解析 m3u8 → 写入 xiazai/dongman.yaml → xiazai/main.py --upload
-    # 填 "1" 开启；须在 jiankong/pipeline_config.py 配置 ITEM_KEY_TO_DONGMAN_YAML
-    "PIPELINE_ENABLED": "",
+    # 自动化：集数变更并通知后，解析 m3u8 → 写入 SQLite → 下载 → 上传 → 删除本地文件
+    # 填 "1" 开启（默认开启）；须在 jiankong/pipeline_config.py 配置 ITEM_KEY_TO_SHOW_ID
+    "PIPELINE_ENABLED": "1",
     # 默认 moon_tv：/api/search 按 source_name 匹配，读 episodes 取 m3u8；stub|placeholder|import
     "M3U8_RESOLVER_MODE": "",
 }
@@ -514,13 +514,57 @@ def run() -> int:
 
 
 def main() -> int:
+    """命令行入口，支持单次运行和循环监控模式。
+
+    用法:
+      python jiankong/favorites_notify.py              # 单次检查
+      python jiankong/favorites_notify.py --loop        # 循环监控（默认 30 分钟）
+      python jiankong/favorites_notify.py --loop --interval 600  # 每 10 分钟
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(description="MoonTV 收藏监控 + 自动下载上传")
+    parser.add_argument("--loop", action="store_true", help="循环监控模式")
+    parser.add_argument(
+        "--interval", type=int, default=1800,
+        help="循环间隔秒数（默认 1800 = 30 分钟）"
+    )
+    args = parser.parse_args()
+
     setup_logging()
-    logging.info("启动 favorites_notify")
-    try:
-        return run()
-    except KeyboardInterrupt:
-        logging.info("中断")
-        return 130
+
+    if not args.loop:
+        logging.info("启动 favorites_notify（单次）")
+        try:
+            return run()
+        except KeyboardInterrupt:
+            logging.info("中断")
+            return 130
+
+    # 循环监控模式
+    logging.info(
+        "启动 favorites_notify 循环监控（间隔 %s 秒 = %s 分钟）",
+        args.interval, round(args.interval / 60, 1),
+    )
+    import time
+
+    while True:
+        try:
+            ret = run()
+            if ret != 0:
+                logging.warning("本轮检查返回码=%s，继续下一轮", ret)
+        except KeyboardInterrupt:
+            logging.info("循环监控已停止")
+            return 0
+        except Exception:
+            logging.exception("本轮检查异常，%s 秒后重试", args.interval)
+
+        logging.info("等待 %s 秒后下一轮检查...", args.interval)
+        try:
+            time.sleep(args.interval)
+        except KeyboardInterrupt:
+            logging.info("循环监控已停止")
+            return 0
 
 
 if __name__ == "__main__":

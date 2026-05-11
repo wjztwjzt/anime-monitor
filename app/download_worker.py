@@ -22,7 +22,7 @@ if str(_pkg_root) not in sys.path:
 
 from app.config_loader import database_path, load_config, resolve_rel
 from app.paths import project_root
-from app.proxy_util import build_socks5_url
+
 from app.store import (
     connect,
     ensure_schema,
@@ -206,68 +206,6 @@ def resolve_cover(cfg: dict[str, Any], root: Path) -> Path:
     return p
 
 
-def resolve_fastupload_script(cfg: dict[str, Any], root: Path) -> Path:
-    paths = cfg.get("paths") or {}
-    raw = str(
-        paths.get("telethon_fastupload_script")
-        or "Telethon-FastUpload/Telethon_FastUpload_speed.py"
-    ).strip()
-    p = Path(raw)
-    if not p.is_absolute():
-        p = (root / p).resolve()
-    if not p.is_file():
-        sys.exit(f"找不到 FastUpload 脚本: {p}")
-    return p
-
-
-def build_fastupload_env(
-    cfg: dict[str, Any],
-    root: Path,
-    *,
-    caption: str,
-    thumb: Path,
-    mp4_parent: Path,
-) -> dict[str, str]:
-    paths = cfg.get("paths") or {}
-    env_file = paths.get("telethon_env_file")
-    if env_file:
-        ef = resolve_rel(root, str(env_file))
-        try:
-            from dotenv import load_dotenv
-
-            load_dotenv(ef, override=False)
-        except ImportError:
-            pass
-
-    env = os.environ.copy()
-    env["TELEGRAM_CAPTION"] = caption
-    env["TELEGRAM_THUMB"] = str(thumb.resolve())
-    env["TELEGRAM_DOWNLOAD_DIR"] = str(mp4_parent.resolve())
-
-    px = cfg.get("proxy") or {}
-    upx = px.get("upload") if isinstance(px, dict) else {}
-    socks = build_socks5_url(upx if isinstance(upx, dict) else {})
-    if socks:
-        env["TELEGRAM_PROXY"] = socks
-
-    tg = cfg.get("telegram") or {}
-    if isinstance(tg, dict):
-        if str(tg.get("api_id") or "").strip():
-            env["TELEGRAM_API_ID"] = str(tg["api_id"]).strip()
-        if str(tg.get("api_hash") or "").strip():
-            env["TELEGRAM_API_HASH"] = str(tg["api_hash"]).strip()
-        if str(tg.get("target") or "").strip():
-            env["TELEGRAM_TARGET"] = str(tg["target"]).strip()
-        if str(tg.get("phone") or "").strip():
-            env["TELEGRAM_PHONE"] = str(tg["phone"]).strip()
-        sess = str(tg.get("session_path") or "").strip()
-        if sess:
-            sp = resolve_rel(root, sess)
-            env["TELEGRAM_SESSION"] = str(sp)
-
-    return env
-
-
 def seed_shows(conn: sqlite3.Connection, cfg: dict[str, Any]) -> None:
     shows = cfg.get("shows") or []
     if not isinstance(shows, list):
@@ -319,10 +257,6 @@ def run_download_upload(upload_enabled_override: bool | None = None) -> None:
 
     xiazai_dir = root / "xiazai"
     cover_path = resolve_cover(cfg, root)
-    fu_script = resolve_fastupload_script(cfg, root)
-    fu_root = fu_script.parent
-    fu_cfg = cfg.get("fastupload") or {}
-    socks_u = socks_url_from_cfg(cfg)
 
     profiles = list_show_profiles(conn)
     if not profiles:
@@ -332,8 +266,7 @@ def run_download_upload(upload_enabled_override: bool | None = None) -> None:
     print(
         f"数据库: {db_path}\n"
         f"封面: {cover_path}\n"
-        f"模式: {'下载+上传' if upload_enabled else '仅下载'}\n"
-        f"上传代理(SOCKS5): {socks_u or '(未启用/将 --no-proxy)'}"
+        f"模式: {'下载+上传' if upload_enabled else '仅下载'}"
     )
 
     for prof in profiles:
@@ -415,28 +348,21 @@ def run_download_upload(upload_enabled_override: bool | None = None) -> None:
             else:
                 caption = f"🎬 {topic_name}第{ep}集"
 
-            env = build_fastupload_env(cfg, root, caption=caption, thumb=cover_path, mp4_parent=out_path.parent)
-            cmd = [sys.executable, str(fu_script), "--file", str(out_path.resolve())]
-            conn_upload = int(fu_cfg.get("connections") or 0) or None
-            if conn_upload:
-                cmd.extend(["--connections", str(conn_upload)])
-            if not socks_u:
-                cmd.append("--no-proxy")
-
             ok = False
             for attempt in range(1, upload_retries + 1):
                 print(f"  upload ep{ep} (attempt {attempt})")
                 try:
-                    r = subprocess.run(
-                        cmd,
-                        cwd=str(fu_root),
-                        env=env,
-                        stdin=subprocess.DEVNULL,
+                    import asyncio
+                    ok = asyncio.run(
+                        upload_via_telegram_manager(
+                            file_path=out_path,
+                            caption=caption,
+                            thumb_path=cover_path,
+                        )
                     )
-                    if r.returncode == 0:
-                        ok = True
+                    if ok:
                         break
-                except OSError as e:
+                except Exception as e:
                     print(f"  upload ep{ep} error: {e}", file=sys.stderr)
                 set_episode_status(conn, show_id, ep, upload_status="upload_failed")
                 conn.commit()
@@ -453,11 +379,6 @@ def run_download_upload(upload_enabled_override: bool | None = None) -> None:
 
     conn.close()
 
-
-def socks_url_from_cfg(cfg: dict[str, Any]) -> str | None:
-    px = cfg.get("proxy") or {}
-    up = px.get("upload") if isinstance(px, dict) else {}
-    return build_socks5_url(up if isinstance(up, dict) else {})
 
 
 async def upload_via_telegram_manager(

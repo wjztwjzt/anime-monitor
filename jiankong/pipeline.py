@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import os
-import subprocess
 import sys
 from pathlib import Path
 
@@ -48,12 +47,6 @@ def run_pipeline_for_changes(changes: list[dict]) -> None:
     cur = conn.cursor()
     ensure_schema(cur)
     conn.commit()
-
-    run_main = ROOT / "run.py"
-    if not run_main.is_file():
-        logging.error("找不到 %s", run_main)
-        conn.close()
-        return
 
     modified = False
 
@@ -116,17 +109,16 @@ def run_pipeline_for_changes(changes: list[dict]) -> None:
         "on",
     )
     if skip_run:
-        logging.info("PIPELINE_SKIP_XIAZAI 已设置，不调用 run.py")
+        logging.info("PIPELINE_SKIP_XIAZAI 已设置，不执行下载上传")
         return
 
     if not modified:
         return
 
-    logging.info("启动下载/上传: python run.py --upload")
-    rc = subprocess.run(
-        [sys.executable, str(run_main), "--upload"],
-        cwd=str(ROOT),
-        stdin=subprocess.DEVNULL,
-    ).returncode
-    if rc != 0:
-        logging.error("run.py 退出码 %s", rc)
+    logging.info("启动下载/上传（直接调用 download_worker）")
+    try:
+        from app.download_worker import run_download_upload
+
+        run_download_upload(upload_enabled_override=True)
+    except Exception:
+        logging.exception("下载/上传流程异常")
