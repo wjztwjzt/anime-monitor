@@ -76,9 +76,9 @@ def load_monitor_config(cfg: dict) -> dict:
     }
 
 
-def search_show_episode_count(show: dict, base_url: str) -> dict | None:
+def search_show_episode_count(show: dict, base_url: str, *, expected_episode_count: int = 0) -> dict | None:
     """
-    搜索单剧：用 search_keyword 调用多供应商搜索，取最高集数结果。
+    搜索单剧：用 search_keyword 调用多供应商搜索，取最佳匹配结果。
 
     返回:
       {title, source_name, source_id, vod_id, total_episodes, episodes_list}
@@ -89,7 +89,7 @@ def search_show_episode_count(show: dict, base_url: str) -> dict | None:
         logging.warning("剧集 %s 未配置 search_keyword，跳过", show.get("id", "?"))
         return None
 
-    results = search_all_providers(kw, base_url)
+    results = search_all_providers(kw, base_url, expected_episode_count=expected_episode_count)
     if not results:
         return None
 
@@ -158,12 +158,14 @@ def detect_show_changes(
     topic_name = str(show.get("topic_name") or show_id)
     search_kw = str(show.get("search_keyword") or "").strip()
 
-    result = search_show_episode_count(show, base_url)
+    state = get_show_monitor_state(conn, show_id)
+    old_total = int(state["last_episode_count"]) if state else 0
+
+    result = search_show_episode_count(show, base_url, expected_episode_count=old_total)
     if result is None:
         return None
 
     new_total = result["total_episodes"]
-    state = get_show_monitor_state(conn, show_id)
 
     if state is None:
         # 新剧：基线入库，不发通知

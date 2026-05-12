@@ -77,25 +77,35 @@ def _is_different_show_indicator(text: str) -> bool:
     return any(ind in t for ind in _indicators)
 
 
-def _title_match_ok(target: str, row_title: str) -> bool:
-    """判断搜索结果的标题是否与目标匹配（排除「牧神记→牧神记短剧」类误匹配）。"""
+def _title_match_quality(target: str, row_title: str) -> int:
+    """
+    返回匹配质量分数：
+      2 = 精确匹配（完全相等）
+      1 = 包含匹配（target 是 row_title 子串，且长度比 ≥ 0.5，且额外部分非「不同剧」标记）
+      0 = 不匹配
+    """
     t = target.lower().strip()
     r = row_title.lower().strip()
     if not t or not r:
-        return False
+        return 0
     if t == r:
-        return True
+        return 2
     if t in r:
         extra = r.replace(t, "", 1)
         if _is_different_show_indicator(extra):
-            return False
-        return True
+            return 0
+        # 子串匹配需长度比 ≥ 50%，防止「盘龙」匹配「盘龙卧虎高山顶」
+        if len(t) < len(r) * 0.5:
+            return 0
+        return 1
     if r in t:
         extra = t.replace(r, "", 1)
         if _is_different_show_indicator(extra):
-            return False
-        return True
-    return False
+            return 0
+        if len(r) < len(t) * 0.5:
+            return 0
+        return 1
+    return 0
 
 
 def search_all_providers(
@@ -105,8 +115,11 @@ def search_all_providers(
     min_title_similarity: float = 0.8,
     max_retries: int = 3,
     retry_delay: float = 5.0,
+    expected_episode_count: int = 0,
 ) -> list[dict[str, Any]]:
-    """搜索动漫标题，返回所有匹配的提供商条目（按集数降序）。带重试机制应对 API 返回空。"""
+    """搜索动漫标题，返回所有匹配的提供商条目（按匹配置信度+集数排序）。
+    带重试机制应对 API 返回空。expected_episode_count 用于过滤离群结果。
+    """
     q = title.strip()
     if not q:
         return []
@@ -140,23 +153,96 @@ def search_all_providers(
             logging.warning("搜索无结果（已重试%s次）: %s", max_retries, q)
             return []
 
-        results: list[dict[str, Any]] = []
         target_lower = title.lower().strip()
+        scored: list[tuple[int, dict[str, Any]]] = []
 
         for row in rows:
             row_title = _extract_title(row).lower()
             if not row_title:
                 continue
-            if _title_match_ok(target_lower, row_title):
-                results.append(row)
+            quality = _title_match_quality(target_lower, row_title)
+            if quality > 0:
+                scored.append((quality, row))
                 continue
             # 模糊匹配：字符重叠度
             overlap = len(set(target_lower) & set(row_title))
             if overlap >= max(len(target_lower), len(row_title)) * min_title_similarity:
-                results.append(row)
+                scored.append((0, row))
 
-        if results:
-            results.sort(key=_extract_episode_count, reverse=True)
+        if scored:
+            # 按 匹配质量 ↓ → 集数合理度 → 集数 ↓ 排序
+            expected = expected_episode_count if expected_episode_count > 0 else 0
+
+            def _sort_key(item: tuple[int, dict[str, Any]]) -> tuple[int, int, int]:
+                quality, row = item
+                ep = _extract_episode_count(row)
+                # 集数合理度：越接近 expected 越优先（expected=0 时不干预）
+                # 对集数远超 expected 的结果施加惩罚
+                penalty = 0
+                if expected > 0 and ep > expected:
+                    ratio = ep / expected
+                    if ratio > 1.5:
+                        penalty = int(ratio * 100)  # 越大惩罚越重
+                # 返回排序元组：质量(高优先) → 集数合理度(低惩罚优先) → 集数(低优先)
+                # quality 取负使高质排前，penalty 正数使惩罚大的排后，ep 取负使低集数排前
+                return (-quality, penalty, -ep)
+
+            scored.sort(key=_sort_key)
+
+            # 离群检测：同标题(质量≥1)结果中，剔除集数为中位数 2x 以上的极端离群
+            quality_results = [r for q, r in scored if q >= 1]
+            if len(quality_results) >= 3:
+                counts = sorted([_extract_episode_count(r) for r in quality_results])
+                median = counts[len(counts) // 2]
+                if median > 0 and counts[-1] > median * 2:
+                    outlier_threshold = median * 2
+                    logging.info(
+                        "搜索 %s 检测到集数离群值 (%s > %s×2)，已过滤",
+                        q, counts[-1], median,
+                    )
+                    scored = [
+                        (q, r) for q, r in scored
+                        if not (q >= 1 and _extract_episode_count(r) > outlier_threshold)
+                    ]
+                    if not scored:
+                        scored = [(q, r) for q, r in [(0, row) for row in quality_results]]
+
+            # 2个同名结果集数差异大 → 保守取较低集数，并告警
+            if len(quality_results) == 2:
+                c0 = _extract_episode_count(quality_results[0])
+                c1 = _extract_episode_count(quality_results[1])
+                if min(c0, c1) > 0 and max(c0, c1) / min(c0, c1) > 1.5:
+                    hi_count = max(c0, c1)
+                    logging.warning(
+                        "搜索 %s 同名结果集数差异大: %s vs %s，取较低值 %s",
+                        q, max(c0, c1), min(c0, c1), min(c0, c1),
+                    )
+                    # 把高集数条目降到模糊匹配层(quality=0)，确保低集数优先
+                    new_scored: list[tuple[int, dict[str, Any]]] = []
+                    for q, r in scored:
+                        if q >= 1 and _extract_episode_count(r) == hi_count:
+                            new_scored.append((0, r))
+                        else:
+                            new_scored.append((q, r))
+                    scored = new_scored
+                    scored.sort(key=_sort_key)
+                elif min(c0, c1) > 0 and max(c0, c1) / min(c0, c1) > 1.3:
+                    logging.info(
+                        "搜索 %s 同名结果集数有差异: %s vs %s",
+                        q, max(c0, c1), min(c0, c1),
+                    )
+
+            # 多结果时打印完整列表（辅助排查）
+            if len(scored) > 1:
+                lines = []
+                for quality, row in scored[:10]:
+                    ep = _extract_episode_count(row)
+                    t = _extract_title(row)
+                    src = _extract_source_name(row) or _extract_source_id(row)
+                    lines.append(f"  q={quality} ep={ep} [{src}] {t}")
+                logging.info("搜索 %s 共%s条候选:\n%s", q, len(scored), "\n".join(lines))
+
+            results = [r for _, r in scored]
             return results
 
         if attempt < max_retries - 1:
