@@ -67,6 +67,9 @@ monitor:
   # V2 精确匹配需要 moon.658877.xyz（返回 year/douban_id/class 等元数据）
   base_url: "https://moon.658877.xyz"
 
+  # 检测到变更时是否自动触发下载+上传流水线（也可设环境变量 PIPELINE_ENABLED=1）
+  pipeline_enabled: false
+
   # 循环检查间隔（秒），可在命令行 --interval 覆盖
   interval: 1800
 

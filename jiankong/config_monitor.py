@@ -69,11 +69,20 @@ def load_monitor_config(cfg: dict) -> dict:
         "base_url": str(m.get("base_url") or os.environ.get("BASE_URL") or "").strip().rstrip("/"),
         "interval": int(m.get("interval") or 1800),
         "channels": m.get("channels") or [],
+        "pipeline_enabled": _is_truthy(m.get("pipeline_enabled")) or _is_truthy(os.environ.get("PIPELINE_ENABLED")),
         "telegram_channel_verify": {
             "enabled": bool(tv.get("enabled")),
             "scan_message_limit": int(tv.get("scan_message_limit") or 400),
         },
     }
+
+
+def _is_truthy(v: Any) -> bool:
+    if v is None:
+        return False
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
 
 
 def search_show_episode_count(show: dict, base_url: str, *, expected_episode_count: int = 0) -> dict | None:
@@ -549,8 +558,7 @@ def run_monitor(config_path: Path | None = None, *, channel_filter: str | None =
 
     changes: list[dict] = []
     pipeline_threads: list[threading.Thread] = []
-    pe = (os.environ.get("PIPELINE_ENABLED") or "").strip().lower()
-    pipeline_on = pe in ("1", "true", "yes", "on")
+    pipeline_on = bool(mc.get("pipeline_enabled"))
 
     for ch in channels:
         ch_id = str(ch.get("id") or "").strip()

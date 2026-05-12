@@ -17,8 +17,22 @@ from jiankong.m3u8_resolve import resolve_new_episode_m3u8_urls
 
 
 def pipeline_enabled() -> bool:
+    """检查 config.yaml monitor.pipeline_enabled 或环境变量 PIPELINE_ENABLED。"""
     v = (os.environ.get("PIPELINE_ENABLED") or "").strip().lower()
-    return v in ("1", "true", "yes", "on")
+    if v in ("1", "true", "yes", "on"):
+        return True
+    try:
+        cfg = load_config()
+        m = cfg.get("monitor") or {}
+        if isinstance(m, dict):
+            p = m.get("pipeline_enabled")
+            if p is True:
+                return True
+            if isinstance(p, str) and p.strip().lower() in ("1", "true", "yes", "on"):
+                return True
+    except Exception:
+        pass
+    return False
 
 
 
