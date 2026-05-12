@@ -1,6 +1,6 @@
 ---
 name: m3u8-automation
-description: 多频道动漫/影视监控自动化流水线：配置驱动多频道→搜索比对→Telethon频道核验→解析m3u8→下载→上传对应频道(正确宽高比)→删除本地文件。可复用于其他动漫资源监控项目。
+description: 多频道动漫/影视监控自动化流水线 v3.2：配置驱动多频道→MoonTVPlus API 豆瓣ID精确匹配→Telethon频道核验→快通道m3u8提取/解析→下载→上传对应频道(正确宽高比)→删除本地文件。可复用于其他动漫资源监控项目。
 ---
 
 # 多频道监控全自动流水线 Skill (v3.1)
@@ -14,7 +14,10 @@ description: 多频道动漫/影视监控自动化流水线：配置驱动多频
 ├──────────────────────────────────────────────────────────────┤
 │  ① 监控层: jiankong/config_monitor.py                         │
 │     └─ 读取 config.yaml monitor.channels 配置                  │
-│     └─ 遍历频道→剧集: search_keyword 调用 provider_compare     │
+│     └─ show.filters 存在 → V2 精确匹配（moon.658877.xyz）       │
+│     └─ show.filters 不存在 → V1 多供应商比较（tv.658877.xyz）    │
+│     └─ V2: moon_api.search → match_best_show (豆瓣ID/年份评分)  │
+│     └─ V2: extract_new_episode_m3u8s() 直接从搜索提取 m3u8     │
 │     └─ 与 SQLite show_monitor_state 比对集数                   │
 │     └─ 集数上涨 → Telethon 扫频道核实（#标签+「第N集」）        │
 │     └─ 有变更 → 发送 Telegram Bot 通知（按频道分组）            │
@@ -23,12 +26,12 @@ description: 多频道动漫/影视监控自动化流水线：配置驱动多频
 │     └─ 拉取频道历史消息，按 #tag + 集数文案推断已发最大集       │
 │     └─ 双重确认：首次拉取 + 二次确认，避免虚高触发流水线        │
 ├──────────────────────────────────────────────────────────────┤
-│  ③ 解析层: jiankong/pipeline.py → m3u8_resolve.py             │
-│     └─ /api/search → 匹配 source_name → 读取 episodes          │
+│  ③ 解析层: jiankong/pipeline.py → m3u8_resolve.py / moon_api  │
+│     └─ V2 快通道: _episode_urls_direct → 直接写入 episode_jobs  │
+│     └─ V1 回退: /api/search → 匹配 source_name → 读取 episodes │
 │     └─ 输出: {集数: m3u8_url} → 写入 episode_jobs 表           │
 ├──────────────────────────────────────────────────────────────┤
 │  ④ 下载层: app/download_worker.py                             │
-│     └─ 从 data/urls/<channel>/<show>.txt 加载手动 URL          │
 │     └─ N_m3u8DL-RE 子进程 (m3u8 → mp4)                        │
 │     └─ 构建 show_id → (telegram_chat_id, cover) 映射表        │
 ├──────────────────────────────────────────────────────────────┤
@@ -44,15 +47,23 @@ description: 多频道动漫/影视监控自动化流水线：配置驱动多频
 
 ### 2.1 配置驱动监控 (`jiankong/config_monitor.py`)
 
-通过 config.yaml 定义频道和剧集，搜索 API 检测更新。
+通过 config.yaml 定义频道和剧集，搜索 API 检测更新。show.filters 存在时走 V2 精确匹配（moon.658877.xyz），否则回退 V1 多供应商比较。
 
 ```python
+search_show_episode_count(show, base_url, *, expected_episode_count=0) -> dict | None
+# show.filters 存在 → V2: search_all_providers_v2() → match_best_show (豆瓣ID评分)
+# show.filters 不存在 → V1: search_all_providers() 多供应商比较
+# V2 返回额外包含 _moon_result (MoonShowResult) 供 URL 提取
+
+detect_show_changes(show, channel, base_url, conn, *, mc=None) -> dict | None
+# V2 路径: 从 _moon_result 调用 extract_new_episode_m3u8s()
+#         将结果写入 change["_episode_urls_direct"] 供 pipeline 快通道
+
 run_monitor(config_path=None, *, channel_filter=None) -> int
 # ① 加载 config.yaml monitor.channels
-# ② 遍历 channel → show: search_keyword → provider_compare.search_all_providers()
-# ③ 与 SQLite show_monitor_state.last_episode_count 比对
-# ④ 集数上涨 → Telethon 扫频道核实（避免虚高触发管道）
-# ⑤ 有变更 → 记录 changes 列表 → 发送 Telegram 通知 → 触发 pipeline
+# ② 遍历 channel → show: V2/V1 搜索 → 比对集数
+# ③ 集数上涨 → Telethon 扫频道核实
+# ④ 有变更 → 发送 Telegram 通知 → 触发 pipeline
 
 main() -> int
 # CLI: --loop, --interval, --channel, --once
@@ -87,11 +98,13 @@ async scan_channel_max_episode(*, telegram_chat_id, hashtag, message_limit=400) 
 4. 站点 > 频道记录 → 二次 Telethon 拉取确认
 5. 二次确认仍 > → 触发流水线；否则同步基线跳过
 
-### 2.3 流水线 (`jiankong/pipeline.py`)
+### 2.5 流水线 (`jiankong/pipeline.py`)
 
 ```python
 run_pipeline_for_changes(changes: list[dict]) -> None
 # 变更字典直接包含 show_id、channel_id、telegram_chat_id
+# V2 快通道: change["_episode_urls_direct"] 存在 → 跳过 m3u8_resolve，直接写入 episode_jobs
+# V1 回退: _episode_urls_direct 不存在 → resolve_new_episode_m3u8_urls()
 # 写入 episode_jobs 时携带 channel_id
 # 调用 run_download_upload(upload_enabled_override=True)
 ```
@@ -100,6 +113,34 @@ run_pipeline_for_changes(changes: list[dict]) -> None
 ```bash
 PIPELINE_ENABLED=1              # 启用自动下载上传
 PIPELINE_SKIP_XIAZAI=1          # 只解析 m3u8，不下载上传
+```
+
+### 2.3 MoonTVPlus API 客户端 (`jiankong/moon_api.py`) ← v3.2 新增
+
+调用 moon.658877.xyz `/api/search`，一次 API 请求完成搜索+精确匹配+获取 m3u8 URL。通过 douban_id/year/class/source_name/type_name 等元数据评分，消除同名不同剧的误匹配。
+
+```python
+@dataclass
+class MoonShowResult:
+    id: str; title: str; poster: str; episodes: list[str]
+    source: str; source_name: str; class_tags: list[str]
+    year: str; douban_id: str; type_name: str; desc: str
+    vod_remarks: str; vod_total: int; proxy_mode: bool; weight: int
+
+search_moon_api(keyword, base_url, *, max_retries, retry_delay) -> list[MoonShowResult]
+# HTTP GET /api/search?q=keyword，带重试
+
+score_match(result, *, title, douban_id, year_min, year_max,
+            class_keywords, source_preference, type_name) -> tuple[int, str]
+# 评分策略: douban_id匹配=1000, title完全匹配=500, 包含=200,
+#          year范围内=300, class_keywords=50/条, source_preference=200, type_name=100
+# 排除规则: 空白标题、不同剧标记(短剧/剧场版)、标题长度比异常
+
+match_best_show(results, *, title, filters) -> MoonShowResult | None
+# 扫描所有结果，返回评分最高的匹配，无匹配返回 None
+
+extract_new_episode_m3u8s(result, old_total, new_total) -> dict[int, str]
+# 从 episodes 数组提取 (old, new] 集的 m3u8 URL（0-indexed 数组）
 ```
 
 ### 2.4 多供应商比较 (`jiankong/provider_compare.py`)
@@ -370,3 +411,4 @@ TELEGRAM_DISABLE_FAST_UPLOAD=1 python auto_run.py --once
 | v2.0 | 2026-05-12 | 配置驱动多频道监控；移除 favorites API 依赖；config_monitor 搜索比对；manage_channels CLI 管理；多频道独立上传目标；SQLite schema 扩展 |
 | v3.0 | 2026-05-12 | URL 移至 txt 文件存储（一行一集）；移除 v1.1 完全兼容（favorites_notify / pipeline_config / --legacy）；按频道指定封面图；SQLite schema 清理（移除 fav_items / fav_display_names / moon_item_key） |
 | v3.1 | 2026-05-12 | Telethon 频道集数核验（#标签+「第N集」正则推断，双重确认避免虚高触发）；upload 重试改用单事件循环；修复核验跳过时 last_episode_count 未同步基线；新增 scripts/clean_urls_txt.py |
+| v3.2 | 2026-05-12 | MoonTVPlus API 精确匹配：moon.658877.xyz 搜索+豆瓣ID/年份/分类元数据评分；快通道：搜索直接返回 m3u8 URL 跳过 m3u8_resolve；show.filters 配置块控制 V1/V2 路径切换；向后兼容无 filters 时回退 V1 |
