@@ -139,6 +139,8 @@ def search_moon_api(
     if not q:
         return []
 
+    _auth_expired_logged = False
+
     for attempt in range(max_retries):
         if attempt > 0:
             logger.info("MoonTVPlus 搜索重试 %s/%s: %s", attempt + 1, max_retries, q)
@@ -151,6 +153,15 @@ def search_moon_api(
                 {"q": q},
                 referer_path=search_referer_query(q),
             )
+            if r.status_code in (401, 403):
+                if not _auth_expired_logged:
+                    logger.error(
+                        "MoonTVPlus auth 过期 (HTTP %s)，请重新从浏览器获取 cookie 更新 %s",
+                        r.status_code,
+                        "jiankong/cookies.txt",
+                    )
+                    _auth_expired_logged = True
+                return []
             if r.status_code != 200:
                 logger.error("MoonTVPlus HTTP %s: %s", r.status_code, r.text[:400])
                 continue
