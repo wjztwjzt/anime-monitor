@@ -15,6 +15,31 @@ from typing import Any
 from jiankong.moontv_http import moon_tv_get, search_referer_query
 
 
+# ---- V2: moon.658877.xyz 精确匹配 ----
+
+def search_all_providers_v2(
+    keyword: str,
+    base_url: str,
+    *,
+    filters: dict | None = None,
+    max_retries: int = 3,
+    retry_delay: float = 5.0,
+):
+    """V2 搜索：调用 moon.658877.xyz API，用元数据精确匹配，返回最佳 MoonShowResult 或 None。"""
+    from jiankong.moon_api import match_best_show, search_moon_api
+
+    results = search_moon_api(
+        keyword, base_url,
+        max_retries=max_retries,
+        retry_delay=retry_delay,
+    )
+    if not results:
+        return None
+    return match_best_show(results, title=keyword, filters=filters)
+
+
+# ---- V1: tv.658877.xyz ----
+
 def _flatten_search(data: Any) -> list[dict[str, Any]]:
     """从 MoonTV 搜索响应中提取条目列表（兼容多种 JSON 结构）。"""
     if isinstance(data, list):

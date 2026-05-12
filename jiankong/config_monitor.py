@@ -38,7 +38,7 @@ from app.store import (
     upsert_show_monitor_state,
     utc_now_iso,
 )
-from jiankong.provider_compare import search_all_providers
+from jiankong.provider_compare import search_all_providers, search_all_providers_v2
 
 
 def setup_logging() -> None:
@@ -78,10 +78,14 @@ def load_monitor_config(cfg: dict) -> dict:
 
 def search_show_episode_count(show: dict, base_url: str, *, expected_episode_count: int = 0) -> dict | None:
     """
-    搜索单剧：用 search_keyword 调用多供应商搜索，取最佳匹配结果。
+    搜索单剧：用 search_keyword 调用搜索，取最佳匹配结果。
+
+    show.filters 存在时走 V2 路径（moon.658877.xyz 精确元数据匹配），
+    否则走 V1 路径（tv.658877.xyz 多供应商比较）。
 
     返回:
-      {title, source_name, source_id, vod_id, total_episodes, episodes_list}
+      {title, source_name, source_id, vod_id, total_episodes}
+      V2 路径额外包含 _moon_result (MoonShowResult) 供后续提取 m3u8 URL
       或 None（搜索无结果）。
     """
     kw = str(show.get("search_keyword") or "").strip()
@@ -89,6 +93,26 @@ def search_show_episode_count(show: dict, base_url: str, *, expected_episode_cou
         logging.warning("剧集 %s 未配置 search_keyword，跳过", show.get("id", "?"))
         return None
 
+    filters = show.get("filters")
+    if filters and isinstance(filters, dict):
+        # ---- V2: moon.658877.xyz 精确匹配 ----
+        best = search_all_providers_v2(kw, base_url, filters=filters)
+        if best is None:
+            return None
+        logging.info(
+            "搜索(V2) %s → %s (year=%s douban=%s eps=%s source=%s)",
+            kw, best.title, best.year, best.douban_id, best.episode_count, best.source_name,
+        )
+        return {
+            "title": best.title,
+            "source_name": best.source_name,
+            "source_id": best.source,
+            "vod_id": best.id,
+            "total_episodes": best.episode_count,
+            "_moon_result": best,
+        }
+
+    # ---- V1: tv.658877.xyz 多供应商比较 ----
     results = search_all_providers(kw, base_url, expected_episode_count=expected_episode_count)
     if not results:
         return None
@@ -336,7 +360,7 @@ def detect_show_changes(
         old_total, new_total, result["source_name"] or result["source_id"],
     )
 
-    return {
+    change: dict = {
         "show_id": show_id,
         "channel_id": channel_id,
         "telegram_chat_id": telegram_chat_id,
@@ -349,6 +373,19 @@ def detect_show_changes(
         "source_id": result["source_id"],
         "vod_id": result["vod_id"],
     }
+
+    moon_result = result.get("_moon_result")
+    if moon_result is not None:
+        from jiankong.moon_api import extract_new_episode_m3u8s
+        urls = extract_new_episode_m3u8s(moon_result, old_total, new_total)
+        if urls:
+            change["_episode_urls_direct"] = urls
+            logging.info(
+                "V2 快通道: %s 直接从搜索获取 %s 集 m3u8",
+                topic_name, len(urls),
+            )
+
+    return change
 
 
 def send_telegram_notification(bot_token: str, chat_id: str, changes: list[dict], channel_map: dict[str, str]) -> None:

@@ -80,6 +80,7 @@ def ensure_schema_v2(cur: sqlite3.Cursor) -> None:
     )
     for table, col_def in [
         ("show_profiles", "channel_id TEXT DEFAULT ''"),
+        ("show_profiles", "urls_file TEXT DEFAULT ''"),
         ("episode_jobs", "channel_id TEXT DEFAULT ''"),
         ("channels", "cover TEXT DEFAULT ''"),
         ("show_monitor_state", "channel_latest_ep INTEGER NOT NULL DEFAULT 0"),

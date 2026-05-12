@@ -64,7 +64,8 @@ monitor:
   notify_chat_id: "YOUR_CHAT_ID"
 
   # 视频站基础 URL（搜索 + m3u8 解析）
-  base_url: "https://tv.658877.xyz"
+  # V2 精确匹配需要 moon.658877.xyz（返回 year/douban_id/class 等元数据）
+  base_url: "https://moon.658877.xyz"
 
   # 循环检查间隔（秒），可在命令行 --interval 覆盖
   interval: 1800
@@ -90,6 +91,14 @@ monitor:
           download_dir: "xiazai/downloads/mushenji"
           urls_file: "data/urls/anime/牧神记.txt"   # URL txt 文件（一行一集）
           sort_order: 1
+          # V2 精确匹配过滤器（可选，不配置则走 V1 多供应商比较）
+          filters:
+            douban_id: "36576581"       # 豆瓣ID，最精确的匹配方式
+            # year_min: 2024            # 可选：最小开播年份
+            # year_max: 2025            # 可选：最大开播年份
+            # class_keywords: ["动画"]  # 可选：类型必须含这些关键词
+            # source_preference: "jisu" # 可选：优先选择特定源
+            # type_name: "动漫"         # 可选：类型名精确匹配
         - id: xianni
           search_keyword: "仙逆"
           topic_name: "仙逆"

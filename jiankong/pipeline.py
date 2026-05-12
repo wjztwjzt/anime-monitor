@@ -67,16 +67,26 @@ def run_pipeline_for_changes(changes: list[dict]) -> None:
             continue
 
         item_key = str(c.get("key") or f"{source_id}+{vod_id}")
-        episode_urls = resolve_new_episode_m3u8_urls(
-            item_key=item_key,
-            title=title,
-            display_name=search_kw or display_name,
-            old_total=old_total,
-            new_total=new_total,
-            source_name=source_name,
-            source_id=source_id,
-            vod_id=vod_id,
-        )
+
+        # V2 快通道：搜索 API 直接返回了 m3u8 URL，跳过 m3u8_resolve
+        episode_urls_direct = c.get("_episode_urls_direct")
+        if episode_urls_direct:
+            episode_urls = {int(k): str(v) for k, v in episode_urls_direct.items()}
+            logging.info(
+                "V2 快通道: %s 跳过 m3u8 解析，直接使用 %s 集 URL",
+                display_name or show_id, len(episode_urls),
+            )
+        else:
+            episode_urls = resolve_new_episode_m3u8_urls(
+                item_key=item_key,
+                title=title,
+                display_name=search_kw or display_name,
+                old_total=old_total,
+                new_total=new_total,
+                source_name=source_name,
+                source_id=source_id,
+                vod_id=vod_id,
+            )
         if not episode_urls:
             logging.info("未得到 m3u8，跳过写入库: %s", display_name or show_id)
             continue
