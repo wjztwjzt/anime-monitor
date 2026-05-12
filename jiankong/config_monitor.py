@@ -16,9 +16,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import ssl
 import sys
-import urllib.error
-import urllib.request
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -388,8 +388,83 @@ def detect_show_changes(
     return change
 
 
+def _telegram_api_post(bot_token: str, method: str, payload: dict, *, timeout: float = 45) -> bool:
+    """通过 SOCKS5 代理（若有配置）调用 Telegram Bot API，直连失败时回退代理。"""
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    path = f"/bot{bot_token}/{method}"
+    headers = {
+        "Content-Type": "application/json",
+        "Host": "api.telegram.org",
+        "Connection": "close",
+    }
+
+    def _direct() -> bool:
+        import urllib.request
+        req = urllib.request.Request(
+            f"https://api.telegram.org{path}",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            urllib.request.urlopen(req, timeout=timeout).read()
+            return True
+        except Exception:
+            return False
+
+    # 先尝试直连
+    if _direct():
+        return True
+
+    # 直连失败，尝试 SOCKS5 代理
+    socks_url = _load_notify_proxy_url()
+    if not socks_url:
+        return False
+
+    try:
+        from python_socks.sync import Proxy
+        proxy = Proxy.from_url(socks_url)
+        sock = proxy.connect("api.telegram.org", 443)
+        ctx = ssl.create_default_context()
+        ssock = ctx.wrap_socket(sock, server_hostname="api.telegram.org")
+
+        req_line = f"POST {path} HTTP/1.1\r\n"
+        hdr_lines = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
+        hdr_lines += f"Content-Length: {len(body)}\r\n\r\n"
+        ssock.sendall(req_line.encode() + hdr_lines.encode() + body)
+
+        # 读取响应
+        resp = b""
+        while b"\r\n\r\n" not in resp:
+            resp += ssock.recv(4096)
+        ssock.close()
+        status_line = resp.split(b"\r\n")[0].decode()
+        return status_line.startswith("HTTP/1.1 200")
+    except Exception:
+        return False
+
+
+def _load_notify_proxy_url() -> str | None:
+    """从 config.yaml proxy.upload.socks5 构建 SOCKS5 URL。"""
+    try:
+        from app.config_loader import load_config
+        from app.proxy_util import build_socks5_url
+        cfg = load_config()
+        upload_cfg = (cfg.get("proxy") or {}).get("upload")
+        if not isinstance(upload_cfg, dict):
+            # 也尝试 CLI 代理子进程一样的环境变量
+            host = os.environ.get("TELEGRAM_PROXY_HOST") or os.environ.get("SOCKS5_HOST") or ""
+            port = os.environ.get("TELEGRAM_PROXY_PORT") or os.environ.get("SOCKS5_PORT") or ""
+            if host and port:
+                return f"socks5://{host}:{port}"
+            return None
+        return build_socks5_url(upload_cfg)
+    except Exception:
+        return None
+
+
 def send_telegram_notification(bot_token: str, chat_id: str, changes: list[dict], channel_map: dict[str, str]) -> None:
-    """发送 Telegram Bot 通知，按频道分组显示变更。"""
+    """发送 Telegram Bot 通知，按频道分组显示变更。直连失败自动走 SOCKS5 代理。"""
     if not bot_token or not chat_id:
         logging.warning("未配置 notify_bot_token / notify_chat_id，跳过通知")
         return
@@ -403,26 +478,18 @@ def send_telegram_notification(bot_token: str, chat_id: str, changes: list[dict]
     blocks: list[str] = []
     for ch_id, items in by_channel.items():
         ch_name = channel_map.get(ch_id, ch_id)
-        blocks.append(f"📺 {ch_name}")
+        blocks.append(f"  {ch_name}")
         for c in items:
             label = c.get("display_name") or c["title"] or c["show_id"]
             blocks.append(f"  - {label} {c['old_total']}→{c['new_total']}")
 
     msg = "\n".join(blocks)[:3900]
-    payload = json.dumps(
-        {"chat_id": chat_id, "text": msg}, ensure_ascii=False
-    ).encode("utf-8")
-    req = urllib.request.Request(
-        f"https://api.telegram.org/bot{bot_token}/sendMessage",
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        urllib.request.urlopen(req, timeout=45).read()
+    success = _telegram_api_post(bot_token, "sendMessage", {"chat_id": chat_id, "text": msg})
+
+    if success:
         logging.info("已发送 Telegram 通知至 chat_id=%s", chat_id)
-    except Exception:
-        logging.exception("Telegram 通知发送失败")
+    else:
+        logging.error("Telegram 通知发送失败（直连+代理均不可用）")
 
 
 def sync_channels_to_db(conn, channels: list[dict]) -> dict[str, str]:
@@ -481,6 +548,10 @@ def run_monitor(config_path: Path | None = None, *, channel_filter: str | None =
     channel_map = sync_channels_to_db(conn, channels)
 
     changes: list[dict] = []
+    pipeline_threads: list[threading.Thread] = []
+    pe = (os.environ.get("PIPELINE_ENABLED") or "").strip().lower()
+    pipeline_on = pe in ("1", "true", "yes", "on")
+
     for ch in channels:
         ch_id = str(ch.get("id") or "").strip()
         ch_name = str(ch.get("name") or ch_id)
@@ -500,6 +571,15 @@ def run_monitor(config_path: Path | None = None, *, channel_filter: str | None =
                 change = detect_show_changes(show, ch, base_url, conn, mc=mc)
                 if change:
                     changes.append(change)
+                    # 扫到变更立即启动下载（后台线程）
+                    if pipeline_on:
+                        t = threading.Thread(
+                            target=_run_single_change_pipeline,
+                            args=(change,),
+                            daemon=True,
+                        )
+                        t.start()
+                        pipeline_threads.append(t)
             except Exception:
                 logging.exception("检查剧集异常: %s", show.get("topic_name", sid))
 
@@ -512,16 +592,20 @@ def run_monitor(config_path: Path | None = None, *, channel_filter: str | None =
     logging.info("共 %s 条变更，发送通知", len(changes))
     send_telegram_notification(mc["notify_bot_token"], mc["notify_chat_id"], changes, channel_map)
 
-    # 触发流水线
-    pe = (os.environ.get("PIPELINE_ENABLED") or "").strip().lower()
-    if pe in ("1", "true", "yes", "on"):
-        try:
-            from jiankong.pipeline import run_pipeline_for_changes
-            run_pipeline_for_changes(changes)
-        except Exception:
-            logging.exception("流水线执行异常（通知已发出）")
+    # 等待异步流水线完成
+    for t in pipeline_threads:
+        t.join(timeout=3600)
 
     return 0
+
+
+def _run_single_change_pipeline(change: dict) -> None:
+    """在后台线程中执行单个变更的流水线。"""
+    try:
+        from jiankong.pipeline import run_pipeline_for_change
+        run_pipeline_for_change(change)
+    except Exception:
+        logging.exception("流水线执行异常: %s", change.get("display_name", "?"))
 
 
 def main() -> int:
