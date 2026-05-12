@@ -91,7 +91,6 @@ def search_show_episode_count(show: dict, base_url: str) -> dict | None:
 
     results = search_all_providers(kw, base_url)
     if not results:
-        logging.info("搜索无结果: %s", kw)
         return None
 
     best = results[0]

@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from typing import Any
 
 from jiankong.moontv_http import moon_tv_get, search_referer_query
@@ -66,56 +67,103 @@ def _extract_vod_id(item: dict[str, Any]) -> str:
     return _norm_id(item.get("id") or item.get("vod_id") or item.get("vodId"))
 
 
+def _is_different_show_indicator(text: str) -> bool:
+    """检查文本是否含「不同剧」标记（短剧、剧场版等），不应与正片匹配。"""
+    _indicators = [
+        "短剧", "剧场版", "ova", "番外", "特别篇", "外传", "前传",
+        "sp", "总集篇", "番外篇", "oad", "oad版",
+    ]
+    t = text.lower()
+    return any(ind in t for ind in _indicators)
+
+
+def _title_match_ok(target: str, row_title: str) -> bool:
+    """判断搜索结果的标题是否与目标匹配（排除「牧神记→牧神记短剧」类误匹配）。"""
+    t = target.lower().strip()
+    r = row_title.lower().strip()
+    if not t or not r:
+        return False
+    if t == r:
+        return True
+    if t in r:
+        extra = r.replace(t, "", 1)
+        if _is_different_show_indicator(extra):
+            return False
+        return True
+    if r in t:
+        extra = t.replace(r, "", 1)
+        if _is_different_show_indicator(extra):
+            return False
+        return True
+    return False
+
+
 def search_all_providers(
     title: str,
     base_url: str,
     *,
     min_title_similarity: float = 0.8,
+    max_retries: int = 3,
+    retry_delay: float = 5.0,
 ) -> list[dict[str, Any]]:
-    """搜索动漫标题，返回所有匹配的提供商条目（按集数降序）。"""
+    """搜索动漫标题，返回所有匹配的提供商条目（按集数降序）。带重试机制应对 API 返回空。"""
     q = title.strip()
     if not q:
         return []
 
-    try:
-        r = moon_tv_get(
-            base_url,
-            "/api/search",
-            {"q": q},
-            referer_path=search_referer_query(q),
-        )
-        if r.status_code != 200:
-            logging.error("搜索 HTTP %s: %s", r.status_code, r.text[:400])
+    data = None
+    for attempt in range(max_retries):
+        if attempt > 0:
+            logging.info("搜索重试 %s/%s: %s", attempt + 1, max_retries, q)
+            time.sleep(retry_delay)
+
+        try:
+            r = moon_tv_get(
+                base_url,
+                "/api/search",
+                {"q": q},
+                referer_path=search_referer_query(q),
+            )
+            if r.status_code != 200:
+                logging.error("搜索 HTTP %s: %s", r.status_code, r.text[:400])
+                continue
+            data = r.json()
+        except Exception:
+            logging.exception("搜索请求失败 q=%s (attempt %s)", q, attempt + 1)
+            continue
+
+        rows = _flatten_search(data)
+        if not rows:
+            if attempt < max_retries - 1:
+                logging.info("搜索返回空，将重试: %s", q)
+                continue
+            logging.warning("搜索无结果（已重试%s次）: %s", max_retries, q)
             return []
-        data = r.json()
-    except Exception:
-        logging.exception("搜索请求失败 q=%s", q)
-        return []
 
-    rows = _flatten_search(data)
-    if not rows:
-        logging.warning("搜索无结果: %s", q)
-        return []
+        results: list[dict[str, Any]] = []
+        target_lower = title.lower().strip()
 
-    results: list[dict[str, Any]] = []
-    target_lower = title.lower().strip()
+        for row in rows:
+            row_title = _extract_title(row).lower()
+            if not row_title:
+                continue
+            if _title_match_ok(target_lower, row_title):
+                results.append(row)
+                continue
+            # 模糊匹配：字符重叠度
+            overlap = len(set(target_lower) & set(row_title))
+            if overlap >= max(len(target_lower), len(row_title)) * min_title_similarity:
+                results.append(row)
 
-    for row in rows:
-        row_title = _extract_title(row).lower()
-        if not row_title:
-            continue
-        # 简单标题匹配：完全包含或高度相似
-        if target_lower in row_title or row_title in target_lower:
-            results.append(row)
-            continue
-        # 模糊匹配：字符重叠度
-        overlap = len(set(target_lower) & set(row_title))
-        if overlap >= max(len(target_lower), len(row_title)) * min_title_similarity:
-            results.append(row)
+        if results:
+            results.sort(key=_extract_episode_count, reverse=True)
+            return results
 
-    # 按集数降序排列
-    results.sort(key=_extract_episode_count, reverse=True)
-    return results
+        if attempt < max_retries - 1:
+            logging.info("搜索匹配结果为空，将重试: %s", q)
+
+    logging.warning("搜索无结果（已重试%s次）: %s", max_retries, q)
+    return []
 
 
 def get_best_provider(
