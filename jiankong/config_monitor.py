@@ -33,8 +33,10 @@ from app.store import (
     ensure_schema_v2,
     get_show_monitor_state,
     list_channels,
+    update_show_monitor_telegram_cache,
     upsert_channel,
     upsert_show_monitor_state,
+    utc_now_iso,
 )
 from jiankong.provider_compare import search_all_providers
 
@@ -58,12 +60,19 @@ def load_monitor_config(cfg: dict) -> dict:
     m = cfg.get("monitor") or {}
     if not isinstance(m, dict):
         m = {}
+    tv = m.get("telegram_channel_verify")
+    if not isinstance(tv, dict):
+        tv = {}
     return {
         "notify_bot_token": str(m.get("notify_bot_token") or os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip(),
         "notify_chat_id": str(m.get("notify_chat_id") or os.environ.get("TELEGRAM_CHAT_ID") or "").strip(),
         "base_url": str(m.get("base_url") or os.environ.get("BASE_URL") or "").strip().rstrip("/"),
         "interval": int(m.get("interval") or 1800),
         "channels": m.get("channels") or [],
+        "telegram_channel_verify": {
+            "enabled": bool(tv.get("enabled")),
+            "scan_message_limit": int(tv.get("scan_message_limit") or 400),
+        },
     }
 
 
@@ -129,11 +138,19 @@ def detect_show_changes(
     channel: dict,
     base_url: str,
     conn,
+    *,
+    mc: dict | None = None,
 ) -> dict | None:
     """
     搜索剧集，与 SQLite show_monitor_state 比对，返回变更字典或 None。
 
     自动更新 show_monitor_state（新剧基线入库，有变更则更新 last_episode_count）。
+
+    若 monitor.telegram_channel_verify.enabled 为 true（且配置了 telegram_chat_id）：
+    1）库中无频道扫描记录 → Telethon 拉一次写入 channel_latest_ep / channel_ep_checked_at；
+    2）用站点集数 new_total 与库中频道最新集比较：若 new_total ≤ 频道值 → 不更新；
+    3）若 new_total > 频道值 → 再 Telethon 拉一次确认并写库；若仍 new_total ≤ 确认值 → 不更新；
+    4）仅当确认后仍 new_total > 频道最新集时，走原有 upsert + 通知 + 流水线。
     """
     cur = conn.cursor()
     show_id = str(show.get("id") or "").strip()
@@ -171,7 +188,135 @@ def detect_show_changes(
         logging.info("无变更: %s (%s→%s)", topic_name, old_total, new_total)
         return None
 
-    # 有变更：更新状态
+    mc = mc or {}
+    tgv = mc.get("telegram_channel_verify")
+    if not isinstance(tgv, dict):
+        tgv = {}
+    verify_on = bool(tgv.get("enabled")) and not bool(show.get("telegram_verify_disabled"))
+    scan_limit = max(20, int(tgv.get("scan_message_limit") or 400))
+
+    checked_at = (
+        str(state["channel_ep_checked_at"] or "")
+        if "channel_ep_checked_at" in state.keys()
+        else ""
+    )
+    has_channel_record = bool(checked_at.strip())
+
+    ch_db = 0
+    if "channel_latest_ep" in state.keys():
+        try:
+            ch_db = int(state["channel_latest_ep"] or 0)
+        except (TypeError, ValueError):
+            ch_db = 0
+
+    if verify_on:
+        if not telegram_chat_id:
+            logging.warning(
+                "已开启 telegram_channel_verify 但频道未配置 telegram_chat_id，跳过核验: %s",
+                channel.get("name", channel_id),
+            )
+        else:
+            hashtag = str(show.get("telegram_verify_hashtag") or "").strip()
+            if not hashtag:
+                hashtag = f"#{topic_name.replace(' ', '').strip()}"
+
+            from jiankong.channel_episode_telethon import scan_channel_max_episode_blocking
+
+            def _scrape_channel() -> int:
+                return scan_channel_max_episode_blocking(
+                    telegram_chat_id=telegram_chat_id,
+                    hashtag=hashtag,
+                    message_limit=scan_limit,
+                )
+
+            ch_work = ch_db
+            if not has_channel_record:
+                try:
+                    ch_work = _scrape_channel()
+                    update_show_monitor_telegram_cache(
+                        conn,
+                        show_id,
+                        channel_latest_ep=ch_work,
+                        channel_ep_checked_at=utc_now_iso(),
+                    )
+                    conn.commit()
+                    logging.info(
+                        "频道最新集数（库中无记录，首次 Telethon）: %s → %s",
+                        topic_name,
+                        ch_work,
+                    )
+                except Exception:
+                    logging.exception(
+                        "Telethon 首次拉取频道集数失败，跳过本轮（未更新 last_episode_count）: %s",
+                        topic_name,
+                    )
+                    return None
+
+            if new_total <= ch_work:
+                upsert_show_monitor_state(
+                    conn,
+                    show_id=show_id,
+                    channel_id=channel_id,
+                    search_keyword=search_kw,
+                    last_episode_count=new_total,
+                    source_name=result["source_name"],
+                    source_id=result["source_id"],
+                    vod_id=result["vod_id"],
+                    title=result["title"],
+                )
+                conn.commit()
+                logging.info(
+                    "站点集数 %s 未高于频道记录 %s，已同步基线跳过: %s",
+                    new_total,
+                    ch_work,
+                    topic_name,
+                )
+                return None
+
+            try:
+                ch2 = _scrape_channel()
+                update_show_monitor_telegram_cache(
+                    conn,
+                    show_id,
+                    channel_latest_ep=ch2,
+                    channel_ep_checked_at=utc_now_iso(),
+                )
+                conn.commit()
+                logging.info(
+                    "站点 %s > 频道记录 %s，二次 Telethon 确认频道最新集=%s: %s",
+                    new_total,
+                    ch_work,
+                    ch2,
+                    topic_name,
+                )
+            except Exception:
+                logging.exception(
+                    "Telethon 二次确认失败，跳过本轮（未更新 last_episode_count）: %s",
+                    topic_name,
+                )
+                return None
+
+            if new_total <= ch2:
+                upsert_show_monitor_state(
+                    conn,
+                    show_id=show_id,
+                    channel_id=channel_id,
+                    search_keyword=search_kw,
+                    last_episode_count=new_total,
+                    source_name=result["source_name"],
+                    source_id=result["source_id"],
+                    vod_id=result["vod_id"],
+                    title=result["title"],
+                )
+                conn.commit()
+                logging.info(
+                    "二次确认后站点 %s ≤ 频道 %s，已同步基线跳过流水线: %s",
+                    new_total,
+                    ch2,
+                    topic_name,
+                )
+                return None
+
     upsert_show_monitor_state(
         conn,
         show_id=show_id,
@@ -314,7 +459,7 @@ def run_monitor(config_path: Path | None = None, *, channel_filter: str | None =
             if not sid:
                 continue
             try:
-                change = detect_show_changes(show, ch, base_url, conn)
+                change = detect_show_changes(show, ch, base_url, conn, mc=mc)
                 if change:
                     changes.append(change)
             except Exception:

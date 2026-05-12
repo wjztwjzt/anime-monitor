@@ -69,6 +69,11 @@ monitor:
   # 循环检查间隔（秒），可在命令行 --interval 覆盖
   interval: 1800
 
+  # 站点集数上涨时，用 Telethon 扫频道历史（#标签 +「第N集」）核对频道已发最大集，避免虚高重复拉取
+  telegram_channel_verify:
+    enabled: true
+    scan_message_limit: 400
+
   # 频道列表：每个频道对应一个 Telegram 群组/频道
   channels:
     - id: anime
@@ -85,23 +90,97 @@ monitor:
           download_dir: "xiazai/downloads/mushenji"
           urls_file: "data/urls/anime/牧神记.txt"   # URL txt 文件（一行一集）
           sort_order: 1
-
+        - id: xianni
+          search_keyword: "仙逆"
+          topic_name: "仙逆"
+          anime_prefix: "仙逆第"
+          caption_file: "Telethon-FastUpload/仙逆.txt"
+          download_dir: "xiazai/downloads/xianni"
+          urls_file: "data/urls/anime/仙逆.txt"   # URL txt 文件（一行一集）
+          sort_order: 2
+        - id: cangyuantu
+          search_keyword: "沧元图"
+          topic_name: "沧元图"
+          anime_prefix: "沧元图第"
+          caption_file: "Telethon-FastUpload/沧元图.txt"
+          download_dir: "xiazai/downloads/cangyuantu"
+          urls_file: "data/urls/anime/沧元图.txt"   # URL txt 文件（一行一集）
+          sort_order: 3
+        - id: zhetian
+          search_keyword: "遮天"
+          topic_name: "遮天"
+          anime_prefix: "遮天第"
+          caption_file: "Telethon-FastUpload/遮天.txt"
+          download_dir: "xiazai/downloads/zhetian"
+          urls_file: "data/urls/anime/遮天.txt"   # URL txt 文件（一行一集）
+          sort_order: 4
+        - id: wanmeishijie
+          search_keyword: "完美世界"
+          topic_name: "完美世界"
+          anime_prefix: "完美世界第"
+          caption_file: "Telethon-FastUpload/完美世界.txt"
+          download_dir: "xiazai/downloads/wanmeishijie"
+          urls_file: "data/urls/anime/完美世界.txt"   # URL txt 文件（一行一集）
+          sort_order: 5
+        - id: panlong
+          search_keyword: "盘龙"
+          topic_name: "盘龙"
+          anime_prefix: "盘龙第"
+          caption_file: "Telethon-FastUpload/盘龙.txt"
+          download_dir: "xiazai/downloads/panlong"
+          urls_file: "data/urls/anime/盘龙.txt"   # URL txt 文件（一行一集）
+          sort_order: 6 
+        - id: zetianji
+          search_keyword: "择天记"
+          topic_name: "择天记"
+          anime_prefix: "择天记第"
+          caption_file: "Telethon-FastUpload/择天记.txt"
+          download_dir: "xiazai/downloads/zetianji"
+          urls_file: "data/urls/anime/择天记.txt"   # URL txt 文件（一行一集）
+          sort_order: 7 
+        - id: xingchenbian
+          search_keyword: "星辰变"
+          topic_name: "星辰变"
+          anime_prefix: "星辰变第"
+          caption_file: "Telethon-FastUpload/星辰变.txt"
+          download_dir: "xiazai/downloads/xingchenbian"
+          urls_file: "data/urls/anime/星辰变.txt"   # URL txt 文件（一行一集）
+          sort_order: 8 
+        - id: jiangye
+          search_keyword: "将夜"
+          topic_name: "将夜"
+          anime_prefix: "将夜第"
+          caption_file: "Telethon-FastUpload/将夜.txt"
+          download_dir: "xiazai/downloads/jiangye"
+          urls_file: "data/urls/anime/将夜.txt"   # URL txt 文件（一行一集）
+          sort_order: 9 
+          # telegram_verify_hashtag: "#牧神记"
+          # telegram_verify_disabled: true
+    - id: chinese_tv
+      name: "国剧频道"
+      telegram_chat_id: "-1003821229494"
+      sort_order: 2
+      shows: 
+        - id: heiyeguancha
+          search_keyword: "黑夜观察"
+          topic_name: "黑夜观察"
+          anime_prefix: "黑夜观察第"
+          caption_file: "Telethon-FastUpload/黑夜观察.txt"
+          download_dir: "xiazai/downloads/heiyeguancha"
+          urls_file: "data/urls/chinese/黑夜观察.txt"   # URL txt 文件（一行一集）
+          sort_order: 1
     - id: american_tv
       name: "美剧频道"
       telegram_chat_id: "-100xxxxxxxxx"
       cover: "covers/american.jpeg"
-      sort_order: 2
+      sort_order: 3
       shows: []
 
     - id: japanese_tv
       name: "日剧频道"
       telegram_chat_id: "-100xxxxxxxxx"
-      sort_order: 3
-      shows: []
-
-    - id: chinese_tv
-      name: "国产剧频道"
-      telegram_chat_id: "-100xxxxxxxxx"
       sort_order: 4
       shows: []
+
+   
 

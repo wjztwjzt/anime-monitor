@@ -82,6 +82,8 @@ def ensure_schema_v2(cur: sqlite3.Cursor) -> None:
         ("show_profiles", "channel_id TEXT DEFAULT ''"),
         ("episode_jobs", "channel_id TEXT DEFAULT ''"),
         ("channels", "cover TEXT DEFAULT ''"),
+        ("show_monitor_state", "channel_latest_ep INTEGER NOT NULL DEFAULT 0"),
+        ("show_monitor_state", "channel_ep_checked_at TEXT NOT NULL DEFAULT ''"),
     ]:
         try:
             cur.execute(f"ALTER TABLE {table} ADD COLUMN {col_def}")
@@ -311,6 +313,40 @@ def get_show_monitor_state(conn: sqlite3.Connection, show_id: str) -> sqlite3.Ro
     return conn.execute(
         "SELECT * FROM show_monitor_state WHERE show_id=?", (show_id,)
     ).fetchone()
+
+
+def update_show_monitor_telegram_cache(
+    conn: sqlite3.Connection,
+    show_id: str,
+    *,
+    channel_latest_ep: int,
+    channel_ep_checked_at: str,
+) -> None:
+    """写入 Telethon 扫频道得到的最新集数及扫描时间（不改动 last_episode_count）。"""
+    conn.execute(
+        """
+        UPDATE show_monitor_state
+        SET channel_latest_ep = ?, channel_ep_checked_at = ?
+        WHERE show_id = ?
+        """,
+        (int(channel_latest_ep), channel_ep_checked_at, show_id),
+    )
+
+
+def bump_show_monitor_channel_latest_ep(
+    conn: sqlite3.Connection,
+    show_id: str,
+    episode: int,
+) -> None:
+    """上传成功后，将频道侧已确认集数抬到不低于本集。"""
+    conn.execute(
+        """
+        UPDATE show_monitor_state
+        SET channel_latest_ep = MAX(COALESCE(channel_latest_ep, 0), ?)
+        WHERE show_id = ?
+        """,
+        (int(episode), show_id),
+    )
 
 
 def list_show_monitor_states(

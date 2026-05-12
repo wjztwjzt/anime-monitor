@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 import subprocess
@@ -24,6 +25,7 @@ from app.config_loader import database_path, load_config, resolve_rel
 from app.paths import project_root
 
 from app.store import (
+    bump_show_monitor_channel_latest_ep,
     connect,
     ensure_schema,
     list_episodes_for_show,
@@ -364,6 +366,12 @@ def run_download_upload(upload_enabled_override: bool | None = None) -> None:
     conn = connect(db_path)
     cur = conn.cursor()
     ensure_schema(cur)
+    try:
+        from app.store import ensure_schema_v2
+
+        ensure_schema_v2(cur)
+    except ImportError:
+        pass
     conn.commit()
 
     seed_shows(conn, cfg, root)
@@ -482,7 +490,6 @@ def run_download_upload(upload_enabled_override: bool | None = None) -> None:
             else:
                 caption = f"🎬 {topic_name}第{ep}集"
 
-            ok = False
             prog_cb = _make_show_upload_progress_cb(
                 show_id=show_id,
                 topic_name=topic_name,
@@ -492,30 +499,36 @@ def run_download_upload(upload_enabled_override: bool | None = None) -> None:
                 file_label=out_path.name,
             )
             upload_slot += 1
-            for attempt in range(1, upload_retries + 1):
-                print(f"  upload ep{ep} (attempt {attempt})", flush=True)
-                try:
-                    import asyncio
-                    ok = asyncio.run(
-                        upload_via_telegram_manager(
+
+            async def _upload_with_retries() -> bool:
+                for attempt in range(1, upload_retries + 1):
+                    print(f"  upload ep{ep} (attempt {attempt})", flush=True)
+                    try:
+                        ok2 = await upload_via_telegram_manager(
                             file_path=out_path,
                             caption=caption,
                             target=show_target,
                             thumb_path=show_cover,
                             progress_callback=prog_cb,
                         )
-                    )
-                    if ok:
-                        break
-                except Exception as e:
-                    print(f"  upload ep{ep} error: {e}", file=sys.stderr)
-                set_episode_status(conn, show_id, ep, upload_status="upload_failed")
-                conn.commit()
-                if attempt < upload_retries:
-                    time.sleep(5)
+                        if ok2:
+                            return True
+                    except Exception as e:
+                        print(f"  upload ep{ep} error: {e}", file=sys.stderr)
+                    set_episode_status(conn, show_id, ep, upload_status="upload_failed")
+                    conn.commit()
+                    if attempt < upload_retries:
+                        await asyncio.sleep(5)
+                return False
+
+            ok = asyncio.run(_upload_with_retries())
 
             if ok:
                 set_episode_status(conn, show_id, ep, upload_status="uploaded")
+                try:
+                    bump_show_monitor_channel_latest_ep(conn, show_id, ep)
+                except Exception:
+                    pass
                 conn.commit()
                 _delete_local_file(out_path)
                 print(f"  done ep{ep} uploaded")
